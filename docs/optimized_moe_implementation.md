@@ -468,3 +468,35 @@ After reduce-scatter (TP sharded):
 4. **Load Imbalance**: Some devices may receive more tokens than others (mitigated by aux loss in training)
 5. **Implementation Complexity**: More complex logic than fixed sparse approach
 
+# Notes on Performance
+## A2A Dispatch
+New dispatch now does a sparse mcast. If a token is sent to multiple devices, it will pass it along. So if the token starts on device 0 and hits experts and device 2/3/7, then it will send to 2, write to NoC there, 2 will pass it off to 3, write to NoC there, who will pass it off to 7 and write to NoC there
+- *We send the token in 2 directions (ring) and split it in half when it hits the device on the exact other side of the ring*
+- This scales sublinearly now. As more experts along our cluster axis are selected, we teeter off. The number of experts selected on that axis is less of a problem than the average distance those experts live away from that token. If every token is selecting experts 8 hops away, there's more traffic interference than if you just selected next door neighbours
+- If the same token goes to one device (rows) it's only sent once, not twice
+
+Perf table in us
+||E=1|E=2|E=3|E=4|E=5|E=6|E=7|E=8|
+|Best case|26.868|96.183|33.005|36.073|39.141|42.209|45.277|48.345|
+|Avergae case|55.258|66.713|78.169|89.624|101.079|112.535|123.990|135.445|
+|Worst case|88.238|96.183|104.129|112.074|120.020|127.965|135.911|143.856|
+
+Where E=1 - E=8 represents the maximum number of active experts within a column. 
+Best case is the respective number of max. active experts within that column where the hop count (rows) is minimal, average case is the respective number of max. active experts within that column where the hop count (rows) is the average, and worst case is the respective number of max. active experts within that column where the hop count (rows) is maximal.
+
+
+## A2A Combine
+Combine is still p2p, but it reduces locally in case one token does to multiple experts on the same device and is sent back only once per device.
+- There is currently no reduction along the way, i.e. the reduction is done with devices along the path from furthest device to origin device; currently they are sent back separately (one per device) and then reduced on the origin device
+- In the case where the token selects only 1 expert per device column, this reduces to just a p2p
+
+
+## Compute
+MoE compute scales stepwise.
+- When each expert has <= 32 tokens: 235 us
+- For each additional set of (up to) 32 tokens per expert it adds on around 130 us
+Example:
+E0 has 17, E1 has 17 -> ~235 us
+E0 has 17, E1 has 38 -> ~365 us
+E0 has 38, E1 has 38 -> ~495 us
+E0 has 38, E1 has 70 -> ~625 us

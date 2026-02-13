@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import json
 from collections import defaultdict
 from typing import Dict, List, Tuple
@@ -54,10 +55,35 @@ def main() -> None:
     ap.add_argument("--shared-id", type=int, default=256)
     ap.add_argument("--only-original", action="store_true", help="Plot only one bar per original expert")
     ap.add_argument("--baseline-original", action="store_true", help="Ignore placement; use row-wise expert ids + shared per device")
+    ap.add_argument("--text", action="store_true", help="Render text values instead of bar heights")
+    ap.add_argument("--freq-folder", default="", help="Folder containing expert_frequency.csv")
+    ap.add_argument("--layer", type=int, default=0, help="Layer id to select from expert_frequency.csv")
     args = ap.parse_args()
 
-    freqs = compute_freqs(args.trace, args.experts + (1 if args.include_shared else 0), args.include_shared, args.shared_id)
-    max_freq = max(freqs) if freqs else 1.0
+    if args.freq_folder:
+        freq_csv = os.path.join(args.freq_folder, "expert_frequency.csv")
+        try:
+            with open(freq_csv, "r", encoding="utf-8") as f:
+                rows = f.readlines()
+            freqs = None
+            for line in rows[1:]:
+                if line.startswith(f"Layer {args.layer},"):
+                    parts = line.strip().split(",")[1:]
+                    freqs = [float(x) for x in parts]
+                    break
+            if freqs is None:
+                freqs = compute_freqs(args.trace, args.experts + (1 if args.include_shared else 0), args.include_shared, args.shared_id)
+        except Exception:
+            freqs = compute_freqs(args.trace, args.experts + (1 if args.include_shared else 0), args.include_shared, args.shared_id)
+    else:
+        freqs = compute_freqs(args.trace, args.experts + (1 if args.include_shared else 0), args.include_shared, args.shared_id)
+    if freqs:
+        if args.include_shared and args.experts > 0:
+            max_freq = max(freqs[:args.experts])
+        else:
+            max_freq = max(freqs)
+    else:
+        max_freq = 1.0
 
     if args.baseline_original:
         # Baseline: gated experts placed in row-wise order, one shared expert per device.
@@ -95,23 +121,25 @@ def main() -> None:
         raise SystemExit("matplotlib is required. Install with: pip install matplotlib") from e
 
     # color per original expert
-    cmap = plt.cm.get_cmap("tab20", args.experts + (1 if args.include_shared else 0))
+    cmap = plt.colormaps.get_cmap("tab20").resampled(args.experts + (1 if args.include_shared else 0))
 
     fig, ax = plt.subplots(figsize=(args.cols * 1.2, args.rows * 1.2))
     ax.set_xlim(0, args.cols)
     ax.set_ylim(0, args.rows)
-    ax.set_xticks(range(args.cols))
-    ax.set_yticks(range(args.rows))
+    ax.set_xticks([c + 0.5 for c in range(args.cols)])
+    ax.set_yticks([r + 0.5 for r in range(args.rows)])
+    ax.set_xticklabels([str(c) for c in range(args.cols)])
+    ax.set_yticklabels([str(r) for r in range(args.rows)])
     ax.invert_yaxis()
     ax.set_xlabel("Column")
     ax.set_ylabel("Row")
     ax.set_title("Expert Placement Grid")
 
-    # draw grid
+    # draw device grid (thicker)
     for r in range(args.rows + 1):
-        ax.axhline(r, color="lightgray", linewidth=0.5)
+        ax.axhline(r, color="gray", linewidth=1.0)
     for c in range(args.cols + 1):
-        ax.axvline(c, color="lightgray", linewidth=0.5)
+        ax.axvline(c, color="gray", linewidth=1.0)
 
     for did, insts in device_instances.items():
         r = did // args.cols
@@ -138,10 +166,43 @@ def main() -> None:
             freq = freqs[oid] if oid < len(freqs) else 0.0
             height = freq / max_freq if max_freq > 0 else 0.0
             x0 = c + idx * bar_width
-            y0 = r + (1.0 - height)
             color = cmap(oid)
-            rect = plt.Rectangle((x0, y0), bar_width, height, color=color)
-            ax.add_patch(rect)
+            # expert sub-cell grid
+            ax.add_patch(plt.Rectangle((x0, r), bar_width, 1.0, fill=False, edgecolor="lightgray", linewidth=0.3))
+            if args.text:
+                ax.text(
+                    x0 + bar_width / 2,
+                    r + 0.5,
+                    f"E:{oid}\n{freq:.4f}",
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                    color="black",
+                )
+            else:
+                y0 = r + (1.0 - height)
+                rect = plt.Rectangle((x0, y0), bar_width, height, color=color)
+                ax.add_patch(rect)
+                # Add expert id at top of bar and frequency at bottom
+                # Expert id at top of cell, frequency at bottom of cell
+                ax.text(
+                    x0 + bar_width / 2,
+                    r + 0.10,
+                    f"{oid}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=5,
+                    color="black",
+                )
+                ax.text(
+                    x0 + bar_width / 2,
+                    r + 0.90,
+                    f"{freq:.4f}",
+                    ha="center",
+                    va="top",
+                    fontsize=5,
+                    color="black",
+                )
 
     plt.tight_layout()
     plt.savefig(args.out, dpi=200)

@@ -6,51 +6,63 @@ This model captures **only the components affected by expert replication and pla
 - **Expert Compute**
 - **A2A Combine (DP rows)**
 
-Everything else (gate, all‑gather, reduce‑scatter, etc.) is treated as constant and ignored for balancing.
+Everything else is treated as constant and ignored for balancing.
 
 ---
 
 ## 1) A2A Dispatch (DP rows)
 
-Dispatch cost is driven by the amount of data that must cross **rows** to reach the chosen expert replicas.
+Dispatch uses the optimized sparse‑multicast ring. For each token we compute:
+
+- `E_col`: maximum number of **distinct experts** active in any column.
+- `avg_hop`: average hop distance (rows) for the token.
+- `max_hop`: maximum hop distance (rows) for the token.
+
+We model dispatch time (µs) as:
 
 ```
-T_dispatch = bytes_dispatched_across_rows / BW_row
+T_dispatch = A + B*E_col + C*avg_hop + D*max_hop
 ```
 
-Placement and replication reduce this term when replicas are co‑located on the same row as origin tokens.
+The coefficients `(A,B,C,D)` are **calibrated** from the hardware table for best/avg/worst hop conditions.
+The calibration is performed in `sim/cost_model.py::calibrate_dispatch_coeffs`.
 
 ---
 
-## 2) Expert Compute (Dense)
+## 2) Expert Compute
 
-Compute cost is dominated by the **most loaded device** (or expert group) after routing, replication, and placement.
-
-Let `t_e` be the number of tokens assigned to expert replica `e` on a device. Then:
+Compute is per device and **sums per‑expert stepwise costs**:
 
 ```
-T_expert = max_device ( Σ_e t_e * cost_ffn / F_matmul )
+T_expert_device = Σ_e ( 235 + 130 * floor((t_e - 1)/32) )
 ```
 
-In practice:
+Where `t_e` is the number of tokens sent to expert `e` on that device.
+
+We use:
 
 ```
-T_expert ∝ max_device ( total_tokens_on_device )
+T_compute = max_device(T_expert_device)
 ```
 
-Replication reduces hot‑expert load; placement controls where those loads land.
+This reflects that the slowest device dominates latency.
 
 ---
 
 ## 3) A2A Combine (DP rows)
 
-Combine cost is again driven by row‑crossing traffic (returning expert outputs to token‑origin rows).
+Combine is p2p with **per‑device reduction** (one return per device). For each token:
+
+- `U`: number of **distinct devices** that received experts.
+- `avg_hop`, `max_hop` as above.
+
+We model combine time (µs) using the same calibrated dispatch coefficients:
 
 ```
-T_combine = bytes_returned_across_rows / BW_row
+T_combine = A + B*U + C*avg_hop + D*max_hop
 ```
 
-This is typically similar in shape to `T_dispatch`, and benefits from the same locality.
+(We will update coefficients once a combine‑specific calibration table is available.)
 
 ---
 
@@ -59,12 +71,7 @@ This is typically similar in shape to `T_dispatch`, and benefits from the same l
 The balancing‑only latency proxy is:
 
 ```
-T_balance = T_dispatch + T_expert + T_combine
+T_balance = T_dispatch + T_compute + T_combine
 ```
 
-Where:
-- The **comm term** is determined by row‑crossing traffic.
-- The **compute term** is determined by the **max per‑device load**.
-
-This is the part of the model that replication/placement directly optimizes.
-
+This is the part of the model directly influenced by replication and placement.

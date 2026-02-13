@@ -8,7 +8,7 @@ import sys
 import subprocess
 from typing import Dict, List, Tuple, Optional
 
-from cost_model import Mesh, Placement, CostParams, simulate_batch, simulate_batch_instances, aggregate
+from cost_model import Mesh, Placement, CostParams, simulate_batch, simulate_batch_instances, aggregate, calibrate_dispatch_coeffs
 from expert_selection import balanced_expert_selection_replicas
 
 
@@ -544,9 +544,60 @@ def main() -> None:
     ap.add_argument("--objective", choices=["mean", "p95", "p99"], default="mean")
     ap.add_argument("--origin-mode", choices=["average-rows", "round-robin", "random"], default="average-rows")
     ap.add_argument("--save-placement", default="", help="Folder to store placement artifacts")
+    ap.add_argument("--plot-only", action="store_true", help="Only render plots from existing placement.json")
     args = ap.parse_args()
 
     random.seed(args.seed)
+
+    # Plot-only mode: validate config and render plots without running search.
+    if args.plot_only:
+        if not args.save_placement:
+            raise SystemExit("--plot-only requires --save-placement pointing to the run folder")
+        run_cfg_path = os.path.join(args.save_placement, "run_config.json")
+        placement_path = os.path.join(args.save_placement, "placement.json")
+        if not os.path.exists(run_cfg_path) or not os.path.exists(placement_path):
+            raise SystemExit("run_config.json or placement.json missing in save-placement folder")
+        with open(run_cfg_path, "r", encoding="utf-8") as f:
+            run_cfg = json.load(f)
+        # Compare essential config fields
+        expected = {
+            "trace": args.trace,
+            "layer": args.layer,
+            "rows": args.rows,
+            "cols": args.cols,
+            "experts": args.experts,
+            "slots": args.slots,
+            "search": args.search,
+            "routing_strategy": args.routing_strategy,
+            "capacity_factor": args.capacity_factor,
+            "objective": args.objective,
+            "origin_mode": args.origin_mode,
+            "include_shared": not args.no_shared_expert,
+            "shared_row_replication": not args.no_shared_expert_row_replication,
+        }
+        for k, v in expected.items():
+            if str(run_cfg.get(k)) != str(v):
+                raise SystemExit(f"run_config mismatch for {k}: expected {v}, found {run_cfg.get(k)}")
+
+        trace_path = args.trace
+        full_plot = os.path.join(args.save_placement, "placement_instances.png")
+        baseline_plot = os.path.join(args.save_placement, "placement_baseline_originals.png")
+        plot_cmd = [
+            sys.executable, "plots/plot_placement_grid.py",
+            "--placement", placement_path,
+            "--trace", trace_path,
+            "--out", full_plot,
+            "--rows", str(args.rows),
+            "--cols", str(args.cols),
+            "--experts", str(args.experts),
+            "--freq-folder", args.save_placement,
+            "--layer", str(args.layer),
+        ]
+        plot_cmd_base = plot_cmd + ["--baseline-original", "--only-original", "--out", baseline_plot]
+        subprocess.run(plot_cmd, check=False)
+        subprocess.run(plot_cmd_base, check=False)
+        return
+
     mesh = Mesh(args.rows, args.cols)
     trace = load_trace(args.trace, args.layer, max_records=args.max_records, show_progress=args.progress)
 
@@ -564,7 +615,13 @@ def main() -> None:
 
     replication = initial_replication(counts, args.slots, shared_id=256 if include_shared else None, shared_replicas=16)
     # Compute:comm ratio = 1:3 (comm is 3x slower than compute for same token count).
-    params = CostParams(device_capacity=1000.0, row_bandwidth=333.3333333333)
+    coeffs = calibrate_dispatch_coeffs(mesh.rows)
+    params = CostParams(
+        device_capacity=1000.0,
+        row_bandwidth=333.3333333333,
+        dispatch_coeffs=coeffs,
+        combine_coeffs=coeffs,
+    )
 
     best = None
     best_place = None
@@ -689,6 +746,33 @@ def main() -> None:
         with open(placement_path, "w", encoding="utf-8") as f:
             json.dump(best_place.expert_replicas, f, indent=2)
 
+        # Save expert frequency table (layer x expert instance)
+        freq_csv = os.path.join(out_dir, "expert_frequency.csv")
+        mapping = build_instance_mapping(best_place)
+        instance_to_original = []
+        for expert_id in sorted(best_place.expert_replicas.keys()):
+            for _ in best_place.expert_replicas[expert_id]:
+                instance_to_original.append(expert_id)
+        # aggregate per-layer counts
+        layer_counts: Dict[int, List[int]] = {}
+        for rec in trace:
+            layer = rec.get("layer", 0)
+            topk = rec.get("topk_experts", [])
+            if include_shared:
+                topk = _add_shared_expert(topk, shared_id=256)
+            layer_counts.setdefault(layer, [0 for _ in range(total_experts)])
+            for experts in topk:
+                for e in experts:
+                    if 0 <= e < total_experts:
+                        layer_counts[layer][e] += 1
+        with open(freq_csv, "w", encoding="utf-8") as f:
+            f.write("Layer," + ",".join(f"Inst {i}" for i in range(len(instance_to_original))) + "\n")
+            for layer in sorted(layer_counts.keys()):
+                total = sum(layer_counts[layer]) or 1
+                per_orig = [c / total for c in layer_counts[layer]]
+                per_inst = [per_orig[oid] if oid < len(per_orig) else 0.0 for oid in instance_to_original]
+                f.write(f"Layer {layer}," + ",".join(f"{v:.6f}" for v in per_inst) + "\n")
+
         # Save run config
         commit = "unknown"
         try:
@@ -727,6 +811,8 @@ def main() -> None:
             "--rows", str(args.rows),
             "--cols", str(args.cols),
             "--experts", str(args.experts),
+            "--freq-folder", args.save_placement,
+            "--layer", str(args.layer),
         ]
         plot_cmd_base = plot_cmd + ["--baseline-original", "--only-original", "--out", baseline_plot]
         subprocess.run(plot_cmd, check=False)
