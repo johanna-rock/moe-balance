@@ -446,6 +446,35 @@ def _avg_results(results: List[Dict[str, float]]) -> Dict[str, float]:
     return {k: sum(r[k] for r in results) / len(results) for k in keys}
 
 
+def write_expert_frequency_csv(trace: List[Dict], placement: Placement, total_experts: int,
+                               include_shared: bool, out_path: str) -> None:
+    mapping = build_instance_mapping(placement)
+    instance_to_original = mapping.get("instance_to_original")
+    if instance_to_original is None:
+        instance_to_original = []
+        for expert_id in sorted(placement.expert_replicas.keys()):
+            for _ in placement.expert_replicas[expert_id]:
+                instance_to_original.append(expert_id)
+    layer_counts: Dict[int, List[int]] = {}
+    for rec in trace:
+        layer = rec.get("layer", 0)
+        topk = rec.get("topk_experts", [])
+        if include_shared:
+            topk = _add_shared_expert(topk, shared_id=256)
+        layer_counts.setdefault(layer, [0 for _ in range(total_experts)])
+        for experts in topk:
+            for e in experts:
+                if 0 <= e < total_experts:
+                    layer_counts[layer][e] += 1
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("Layer," + ",".join(f"Inst {i}" for i in range(len(instance_to_original))) + "\n")
+        for layer in sorted(layer_counts.keys()):
+            total = sum(layer_counts[layer]) or 1
+            per_orig = [c / total for c in layer_counts[layer]]
+            per_inst = [per_orig[oid] if oid < len(per_orig) else 0.0 for oid in instance_to_original]
+            f.write(f"Layer {layer}," + ",".join(f"{v:.6f}" for v in per_inst) + "\n")
+
+
 def evaluate(trace: List[Dict], placement: Placement, mesh: Mesh, params: CostParams,
              routing_strategy: str, capacity_factor: float, include_shared: bool,
              show_progress: bool = False, label: str = "eval",
@@ -559,6 +588,9 @@ def main() -> None:
             raise SystemExit("run_config.json or placement.json missing in save-placement folder")
         with open(run_cfg_path, "r", encoding="utf-8") as f:
             run_cfg = json.load(f)
+        with open(placement_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        placement_data = Placement(expert_replicas={int(k): v for k, v in raw.items()})
         # Compare essential config fields
         expected = {
             "trace": args.trace,
@@ -594,6 +626,13 @@ def main() -> None:
             "--layer", str(args.layer),
         ]
         plot_cmd_base = plot_cmd + ["--baseline-original", "--only-original", "--out", baseline_plot]
+        # Ensure frequency CSV exists for plot-only runs.
+        freq_csv = os.path.join(args.save_placement, "expert_frequency.csv")
+        if not os.path.exists(freq_csv):
+            trace = load_trace(args.trace, args.layer, max_records=args.max_records, show_progress=args.progress)
+            include_shared = not args.no_shared_expert
+            total_experts = args.experts + (1 if include_shared else 0)
+            write_expert_frequency_csv(trace, placement_data, total_experts, include_shared, freq_csv)
         subprocess.run(plot_cmd, check=False)
         subprocess.run(plot_cmd_base, check=False)
         return
@@ -748,30 +787,7 @@ def main() -> None:
 
         # Save expert frequency table (layer x expert instance)
         freq_csv = os.path.join(out_dir, "expert_frequency.csv")
-        mapping = build_instance_mapping(best_place)
-        instance_to_original = []
-        for expert_id in sorted(best_place.expert_replicas.keys()):
-            for _ in best_place.expert_replicas[expert_id]:
-                instance_to_original.append(expert_id)
-        # aggregate per-layer counts
-        layer_counts: Dict[int, List[int]] = {}
-        for rec in trace:
-            layer = rec.get("layer", 0)
-            topk = rec.get("topk_experts", [])
-            if include_shared:
-                topk = _add_shared_expert(topk, shared_id=256)
-            layer_counts.setdefault(layer, [0 for _ in range(total_experts)])
-            for experts in topk:
-                for e in experts:
-                    if 0 <= e < total_experts:
-                        layer_counts[layer][e] += 1
-        with open(freq_csv, "w", encoding="utf-8") as f:
-            f.write("Layer," + ",".join(f"Inst {i}" for i in range(len(instance_to_original))) + "\n")
-            for layer in sorted(layer_counts.keys()):
-                total = sum(layer_counts[layer]) or 1
-                per_orig = [c / total for c in layer_counts[layer]]
-                per_inst = [per_orig[oid] if oid < len(per_orig) else 0.0 for oid in instance_to_original]
-                f.write(f"Layer {layer}," + ",".join(f"{v:.6f}" for v in per_inst) + "\n")
+        write_expert_frequency_csv(trace, best_place, total_experts, include_shared, freq_csv)
 
         # Save run config
         commit = "unknown"

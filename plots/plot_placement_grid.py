@@ -77,14 +77,6 @@ def main() -> None:
             freqs = compute_freqs(args.trace, args.experts + (1 if args.include_shared else 0), args.include_shared, args.shared_id)
     else:
         freqs = compute_freqs(args.trace, args.experts + (1 if args.include_shared else 0), args.include_shared, args.shared_id)
-    if freqs:
-        if args.include_shared and args.experts > 0:
-            max_freq = max(freqs[:args.experts])
-        else:
-            max_freq = max(freqs)
-    else:
-        max_freq = 1.0
-
     if args.baseline_original:
         # Baseline: gated experts placed in row-wise order, one shared expert per device.
         instance_to_device = []
@@ -100,14 +92,51 @@ def main() -> None:
                 instance_to_device.append(did)
                 instance_to_original.append(args.shared_id)
         # Adjust shared expert frequency to be evenly split per device
-        if args.include_shared and args.shared_id < len(freqs):
-            shared_freq_total = freqs[args.shared_id]
-            per_device = shared_freq_total / max(1, num_devices)
-            freqs = list(freqs)
-            freqs[args.shared_id] = per_device
+        if args.include_shared:
+            per_device = None
+            if len(freqs) <= args.experts + 1 and args.shared_id < len(freqs):
+                shared_freq_total = freqs[args.shared_id]
+                per_device = shared_freq_total / max(1, num_devices)
+                freqs = list(freqs)
+                freqs[args.shared_id] = per_device
     else:
         placement = load_placement(args.placement)
         instance_to_device, instance_to_original = build_instance_mapping(placement)
+
+    # Determine whether freqs are per-instance or per-original
+    freqs_per_instance = None
+    if freqs and len(freqs) == len(instance_to_original):
+        freqs_per_instance = freqs
+    # If baseline and we have per-instance freqs, adjust shared instances per device.
+    if args.baseline_original and freqs_per_instance is not None and args.include_shared:
+        num_devices = args.rows * args.cols
+        shared_vals = [freqs_per_instance[i] for i, oid in enumerate(instance_to_original) if oid == args.shared_id]
+        if shared_vals:
+            shared_freq_total = shared_vals[0]
+            per_device = shared_freq_total / max(1, num_devices)
+            freqs_per_instance = list(freqs_per_instance)
+            for i, oid in enumerate(instance_to_original):
+                if oid == args.shared_id:
+                    freqs_per_instance[i] = per_device
+
+    # Compute max frequency for scaling
+    if freqs:
+        if freqs_per_instance is not None:
+            if args.baseline_original:
+                gated_vals = [freqs_per_instance[i] for i, oid in enumerate(instance_to_original) if oid < args.experts]
+                max_freq = max(gated_vals) if gated_vals else 1.0
+            else:
+                max_freq = max(freqs_per_instance)
+        else:
+            if args.baseline_original:
+                if args.include_shared and args.experts > 0:
+                    max_freq = max(freqs[:args.experts])
+                else:
+                    max_freq = max(freqs)
+            else:
+                max_freq = max(freqs)
+    else:
+        max_freq = 1.0
 
     # group instances per device
     device_instances = defaultdict(list)
@@ -117,11 +146,15 @@ def main() -> None:
     try:
         import matplotlib.pyplot as plt
         import matplotlib.colors as mcolors
+        import matplotlib as mpl
     except Exception as e:
         raise SystemExit("matplotlib is required. Install with: pip install matplotlib") from e
 
-    # color per original expert
-    cmap = plt.colormaps.get_cmap("tab20").resampled(args.experts + (1 if args.include_shared else 0))
+    # Use a small, high-contrast palette + hatches to encode many experts.
+    base_colors = list(mpl.colormaps["tab20"].colors)
+    hatch_patterns = [
+        "", "/", "\\", "|", "-", "+", "x", "o", "O", ".", "*", "//", "\\\\"
+    ]
 
     fig, ax = plt.subplots(figsize=(args.cols * 1.2, args.rows * 1.2))
     ax.set_xlim(0, args.cols)
@@ -163,10 +196,14 @@ def main() -> None:
         bar_width = 1.0 / max(1, len(insts_sorted))
         for idx, inst in enumerate(insts_sorted):
             oid = instance_to_original[inst]
-            freq = freqs[oid] if oid < len(freqs) else 0.0
+            if freqs_per_instance is not None:
+                freq = freqs_per_instance[inst] if inst < len(freqs_per_instance) else 0.0
+            else:
+                freq = freqs[oid] if oid < len(freqs) else 0.0
             height = freq / max_freq if max_freq > 0 else 0.0
             x0 = c + idx * bar_width
-            color = cmap(oid)
+            color = base_colors[oid % len(base_colors)]
+            hatch = hatch_patterns[(oid // len(base_colors)) % len(hatch_patterns)]
             # expert sub-cell grid
             ax.add_patch(plt.Rectangle((x0, r), bar_width, 1.0, fill=False, edgecolor="lightgray", linewidth=0.3))
             if args.text:
@@ -181,7 +218,15 @@ def main() -> None:
                 )
             else:
                 y0 = r + (1.0 - height)
-                rect = plt.Rectangle((x0, y0), bar_width, height, color=color)
+                rect = plt.Rectangle(
+                    (x0, y0),
+                    bar_width,
+                    height,
+                    facecolor=color,
+                    edgecolor="black",
+                    linewidth=0.2,
+                    hatch=hatch,
+                )
                 ax.add_patch(rect)
                 # Add expert id at top of bar and frequency at bottom
                 # Expert id at top of cell, frequency at bottom of cell
