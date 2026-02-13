@@ -42,14 +42,12 @@ python3 sim/convert_npz_to_trace.py \
 # Smaller trace for analysis (no origin rows / no duplication)
 python3 sim/convert_npz_to_trace.py \
   --data-dir data/math-ai_aime25 \
-  --out data/math-ai_aime25/processed/trace_no_origin_rows.jsonl \
-  --skip-origin-rows
+  --out data/math-ai_aime25/processed/trace_no_origin_rows.jsonl
 
 # Limit layers to keep output small
 python3 sim/convert_npz_to_trace.py \
   --data-dir data/math-ai_aime25 \
   --out data/math-ai_aime25/processed/moe_trace_layer0.jsonl \
-  --skip-origin-rows \
   --layers 0
 ```
 

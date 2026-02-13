@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 import argparse
+import os
+import sys
 import json
 import os
 import sys
 from typing import Dict, List, Optional, Set, Tuple
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from sim.replication import replicate_freqs
 

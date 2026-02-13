@@ -5,6 +5,7 @@ import math
 import os
 import random
 import sys
+import subprocess
 from typing import Dict, List, Tuple, Optional
 
 from cost_model import Mesh, Placement, CostParams, simulate_batch, simulate_batch_instances, aggregate
@@ -269,7 +270,10 @@ def place_within_rows(replica_rows: Dict[int, List[int]], mesh: Mesh, max_per_de
             # pick least-loaded device that is under capacity
             candidates = [did for did in row_devs if device_load[did] < max_per_device]
             if not candidates:
-                raise SystemExit(f"Row {r} is saturated: cannot place more than {max_per_device} replicas per device")
+                # fallback: place on any device with capacity
+                candidates = [did for did in range(num_devices) if device_load[did] < max_per_device]
+                if not candidates:
+                    raise SystemExit(f"All devices saturated: cannot place more than {max_per_device} replicas per device")
             best = min(candidates, key=lambda did: (device_load[did], did))
             expert_replicas[e].append(best)
             device_load[best] += 1
@@ -678,7 +682,6 @@ def main() -> None:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             out_dir = os.path.join("analysis_artifacts", f"{base}_layer{args.layer}_{ts}")
 
-        import json, os, subprocess
         os.makedirs(out_dir, exist_ok=True)
 
         # Save placement

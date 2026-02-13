@@ -30,8 +30,6 @@ def main() -> None:
     ap.add_argument("--data-dir", required=True, help="Directory containing .npz files")
     ap.add_argument("--file", default="", help="Convert only this .npz file (basename or path)")
     ap.add_argument("--out", required=True, help="Output JSONL file")
-    ap.add_argument("--rows", type=int, default=16, help="Number of DP rows")
-    ap.add_argument("--skip-origin-rows", action="store_true", help="Do not populate origin_rows or duplicate per row")
     ap.add_argument("--token-slice", choices=["all", "prompt", "output"], default="all")
     ap.add_argument("--layers", default="", help="Comma-separated layer indices to include (empty = all)")
     # origin rows are assigned in round-robin blocks of 32 tokens
@@ -130,30 +128,14 @@ def main() -> None:
                     experts = routed[t, layer].tolist()
                     topk_experts.append([int(x) for x in experts])
 
-                if args.skip_origin_rows:
-                    record = {
-                        "layer": layer,
-                        "batch_id": request_id,
-                        "origin_rows": [],
-                        "topk_experts": topk_experts,
-                        "request_id": request_id,
-                        "source_file": name,
-                    }
-                    out_f.write(json.dumps(record) + "\n")
-                else:
-                    # Duplicate each request for every row: all tokens share the same row.
-                    for req_row in range(args.rows):
-                        origin_rows: List[int] = [req_row for _ in token_indices]
-                        record = {
-                            "layer": layer,
-                            "batch_id": request_id,
-                            "origin_rows": origin_rows,
-                            "topk_experts": topk_experts,
-                            "request_id": request_id,
-                            "source_file": name,
-                            "origin_row": req_row,
-                        }
-                        out_f.write(json.dumps(record) + "\n")
+                record = {
+                    "layer": layer,
+                    "batch_id": request_id,
+                    "topk_experts": topk_experts,
+                    "request_id": request_id,
+                    "source_file": name,
+                }
+                out_f.write(json.dumps(record) + "\n")
             processed += 1
 
     print(f"summary: processed={processed} skipped={skipped}", file=sys.stderr)

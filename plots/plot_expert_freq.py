@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 import argparse
+import os
+import sys
 import json
 import os
 import sys
 from typing import Dict, List, Optional, Set
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from sim.replication import replicate_freqs
 
@@ -148,6 +154,7 @@ def main() -> None:
     ap.add_argument("--dedupe-origin-rows", action="store_true", help="If origin_row exists, only use origin_row=0")
     ap.add_argument("--request-id", default="", help="Filter to a specific request_id")
     ap.add_argument("--replication-slots", type=int, default=0, help="Number of replication slots to add")
+    ap.add_argument("--csv-out", default="", help="Write layer x expert frequency CSV")
     args = ap.parse_args()
 
     if args.layers:
@@ -202,6 +209,15 @@ def main() -> None:
     for layer, val in max_per_layer:
         print(f"  layer {layer}: {val:.4f}%")
     print(f"layers with max frequency > {frequency_threshold:.4f}% (CF>2.00): {layers_over_thresh}")
+
+    if args.csv_out:
+        import csv
+        with open(args.csv_out, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f)
+            header = ["Layer"] + [f"Expert {i}" for i in range(len(data[0]) if data else 0)]
+            writer.writerow(header)
+            for layer, row in zip(layers_sorted, data):
+                writer.writerow([f"Layer {layer}"] + [f"{v:.6f}" for v in row])
 
     try:
         import matplotlib.pyplot as plt
