@@ -40,8 +40,8 @@ class CostParams:
     row_bandwidth: float    # tokens per unit time (legacy)
     dispatch_coeffs: Tuple[float, float, float, float]  # A,B,C,D
     combine_coeffs: Tuple[float, float, float, float]   # A,B,C,D
-    compute_base_us: float = 235.0
-    compute_step_us: float = 130.0
+    compute_base_us: float = 118.0
+    compute_step_us: float = 118.0
     compute_block: int = 32
 
 
@@ -54,12 +54,13 @@ def _compute_time_for_device(expert_token_counts: Dict[int, int],
                              compute_base_us: float,
                              compute_step_us: float,
                              compute_block: int) -> float:
-    # Sum over experts: base + step * floor((t_e - 1)/block)
+    # Sum over experts: 118us per 1-32 token block (ceil)
     total = 0.0
     for t_e in expert_token_counts.values():
         if t_e <= 0:
             continue
-        total += compute_base_us + compute_step_us * math.floor((t_e - 1) / float(compute_block))
+        blocks = math.ceil(t_e / float(compute_block))
+        total += compute_base_us * blocks
     return total
 
 
@@ -89,16 +90,22 @@ def _collect_metrics(origin_rows: List[int], routed: List[List[Tuple[int, int]]]
         hops = []
         col_to_experts: Dict[int, set] = {}
         devices = set()
-        for expert_id, did in dests:
+        for item in dests:
+            if len(item) != 3:
+                raise AssertionError("routed entries must include (orig_id, device_id, inst_id)")
+            expert_id, did, inst_id = item
+            if inst_id is None:
+                raise AssertionError("instance id required for cost model")
             row = did // mesh.cols
             col = did % mesh.cols
             linear = abs(row - origin_row)
             hop = min(linear, mesh.rows - linear)
             hops.append(hop)
-            col_to_experts.setdefault(col, set()).add(expert_id)
+            col_to_experts.setdefault(col, set()).add(inst_id)
             devices.add(did)
             device_expert_counts.setdefault(did, {})
-            device_expert_counts[did][expert_id] = device_expert_counts[did].get(expert_id, 0) + 1
+            key = inst_id if inst_id is not None else expert_id
+            device_expert_counts[did][key] = device_expert_counts[did].get(key, 0) + 1
 
         e_col = max((len(v) for v in col_to_experts.values()), default=0)
         avg_hop = sum(hops) / len(hops) if hops else 0.0
@@ -127,6 +134,7 @@ def _collect_metrics(origin_rows: List[int], routed: List[List[Tuple[int, int]]]
 
 def simulate_batch(origin_rows: List[int], topk_experts: List[List[int]],
                    placement: Placement, mesh: Mesh, params: CostParams) -> Dict[str, float]:
+    raise AssertionError("simulate_batch() without instance ids is not supported in this cost model")
     devices = mesh.devices()
     dev_by_id = {d.device_id: d for d in devices}
 
@@ -160,15 +168,15 @@ def simulate_batch(origin_rows: List[int], topk_experts: List[List[int]],
 def simulate_batch_instances(origin_rows: List[int], active_experts: List[List[int]],
                              instance_to_device: List[int], mesh: Mesh,
                              params: CostParams, instance_to_original: List[int]) -> Dict[str, float]:
-    routed: List[List[Tuple[int, int]]] = []
+    routed: List[List[Tuple[int, int, int]]] = []
     for token_idx, instances in enumerate(active_experts):
-        token_dests: List[Tuple[int, int]] = []
+        token_dests: List[Tuple[int, int, int]] = []
         for inst in instances:
             if inst < 0 or inst >= len(instance_to_device):
                 continue
             did = instance_to_device[inst]
             oid = instance_to_original[inst] if inst < len(instance_to_original) else -1
-            token_dests.append((oid, did))
+            token_dests.append((oid, did, inst))
         routed.append(token_dests)
 
     return _collect_metrics(

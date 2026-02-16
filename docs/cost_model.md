@@ -34,7 +34,7 @@ The calibration is performed in `sim/cost_model.py::calibrate_dispatch_coeffs`.
 Compute is per device and **sums per‑expert stepwise costs**:
 
 ```
-T_expert_device = Σ_e ( 235 + 130 * floor((t_e - 1)/32) )
+T_expert_device = Σ_e ( 118 * ceil(t_e / 32) )
 ```
 
 Where `t_e` is the number of tokens sent to expert `e` on that device.

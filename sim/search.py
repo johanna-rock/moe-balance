@@ -407,15 +407,18 @@ def build_instance_mapping(placement: Placement) -> Dict[str, object]:
     max_expert_id = max(placement.expert_replicas.keys()) if placement.expert_replicas else -1
     expert_id_mapping: List[List[int]] = [[] for _ in range(max_expert_id + 1)]
     instance_to_device: List[int] = []
+    instance_to_original: List[int] = []
     for expert_id in sorted(placement.expert_replicas.keys()):
         replicas = placement.expert_replicas[expert_id]
         for did in replicas:
             instance_id = len(instance_to_device)
             instance_to_device.append(did)
+            instance_to_original.append(expert_id)
             expert_id_mapping[expert_id].append(instance_id)
     return {
         "expert_id_mapping": expert_id_mapping,
         "instance_to_device": instance_to_device,
+        "instance_to_original": instance_to_original,
         "num_expert_instances": len(instance_to_device),
     }
 
@@ -479,6 +482,8 @@ def evaluate(trace: List[Dict], placement: Placement, mesh: Mesh, params: CostPa
              routing_strategy: str, capacity_factor: float, include_shared: bool,
              show_progress: bool = False, label: str = "eval",
              origin_mode: str = "average-rows", seed: int = 0) -> Dict[str, float]:
+    if routing_strategy != "balanced-replicas":
+        raise AssertionError("routing_strategy must be balanced-replicas (instance ids required by cost model)")
     results = []
     mapping = build_instance_mapping(placement)
     expert_id_mapping = mapping["expert_id_mapping"]
@@ -504,7 +509,7 @@ def evaluate(trace: List[Dict], placement: Placement, mesh: Mesh, params: CostPa
                             capacity_factor,
                             num_expert_instances,
                         )
-                        per_row.append(simulate_batch_instances(origin_rows, active_experts, instance_to_device, mesh, params))
+                        per_row.append(simulate_batch_instances(origin_rows, active_experts, instance_to_device, mesh, params, mapping["instance_to_original"]))
                     else:
                         per_row.append(simulate_batch(origin_rows, topk, placement, mesh, params))
                 r = _avg_results(per_row)
@@ -517,7 +522,7 @@ def evaluate(trace: List[Dict], placement: Placement, mesh: Mesh, params: CostPa
                         capacity_factor,
                         num_expert_instances,
                     )
-                    r = simulate_batch_instances(origin_rows, active_experts, instance_to_device, mesh, params)
+                    r = simulate_batch_instances(origin_rows, active_experts, instance_to_device, mesh, params, mapping["instance_to_original"])
                 else:
                     r = simulate_batch(origin_rows, topk, placement, mesh, params)
         else:
@@ -528,7 +533,7 @@ def evaluate(trace: List[Dict], placement: Placement, mesh: Mesh, params: CostPa
                     capacity_factor,
                     num_expert_instances,
                 )
-                r = simulate_batch_instances(origin_rows, active_experts, instance_to_device, mesh, params)
+                r = simulate_batch_instances(origin_rows, active_experts, instance_to_device, mesh, params, mapping["instance_to_original"])
             else:
                 r = simulate_batch(origin_rows, topk, placement, mesh, params)
         results.append(r)
@@ -555,11 +560,12 @@ def main() -> None:
     ap.add_argument("--experts", type=int, default=256)
     ap.add_argument("--slots", type=int, default=384)
     ap.add_argument("--iters", type=int, default=50)
-    ap.add_argument("--search", choices=["random", "row-aware", "anneal", "row-balance", "hot-tier"], default="row-balance")
+    ap.add_argument("--search", choices=["random", "row-aware", "anneal", "row-balance", "hot-tier", "hybrid"], default="row-balance")
     ap.add_argument("--local-search-iters", type=int, default=200)
     ap.add_argument("--anneal-iters", type=int, default=500)
     ap.add_argument("--anneal-t0", type=float, default=1.0)
     ap.add_argument("--anneal-t1", type=float, default=0.01)
+    ap.add_argument("--restarts", type=int, default=1, help="Number of randomized restarts per search")
     ap.add_argument("--coact-csv", default="", help="Write co-activation matrix to CSV")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-records", type=int, default=0, help="Limit number of trace records (0 = no limit)")
@@ -683,87 +689,131 @@ def main() -> None:
 
     max_per_device = int(math.ceil(args.slots / (args.rows * args.cols)))
 
-    if args.search == "row-aware":
-        replica_rows = row_partition(replication, counts, coact, mesh, max_per_device)
-        if shared_row_list:
-            replica_rows[256] = shared_row_list
-        placement = place_within_rows(replica_rows, mesh, max_per_device)
-        placement = local_search(
-            trace, placement, mesh, params,
-            routing_strategy=args.routing_strategy,
-            capacity_factor=args.capacity_factor,
-            include_shared=include_shared,
-            objective=args.objective,
-            iters=args.local_search_iters,
+    def _evaluate_and_print(label: str, placement: Placement, seed: int) -> Tuple[Dict[str, float], Placement]:
+        score = evaluate(
+            trace,
+            placement,
+            mesh,
+            params,
+            args.routing_strategy,
+            args.capacity_factor,
+            include_shared,
+            show_progress=args.progress,
+            label="eval",
+            origin_mode=args.origin_mode,
+            seed=seed,
         )
-        best_place = placement
-        best = evaluate(trace, placement, mesh, params, args.routing_strategy, args.capacity_factor, include_shared, show_progress=args.progress, label="eval", origin_mode=args.origin_mode, seed=args.seed)
         print(
-            f"row-aware[{args.objective}]: mean={best['mean']:.4f} p95={best['p95']:.4f} p99={best['p99']:.4f} "
-            f"dispatch={best.get('max_dispatch_mean', 0.0):.4f} "
-            f"compute={best.get('max_compute_mean', 0.0):.4f} "
-            f"combine={best.get('max_combine_mean', 0.0):.4f}"
+            f"{label}[{args.objective}]: mean={score['mean']:.4f} p95={score['p95']:.4f} p99={score['p99']:.4f} "
+            f"dispatch={score.get('max_dispatch_mean', 0.0):.4f} "
+            f"compute={score.get('max_compute_mean', 0.0):.4f} "
+            f"combine={score.get('max_combine_mean', 0.0):.4f}"
         )
-    elif args.search == "anneal":
-        replica_rows = row_partition(replication, counts, coact, mesh, max_per_device)
-        if shared_row_list:
-            replica_rows[256] = shared_row_list
-        placement = place_within_rows(replica_rows, mesh, max_per_device)
-        placement = simulated_annealing(
-            trace, placement, mesh, params,
-            routing_strategy=args.routing_strategy,
-            capacity_factor=args.capacity_factor,
-            include_shared=include_shared,
-            objective=args.objective,
-            iters=args.anneal_iters, t0=args.anneal_t0, t1=args.anneal_t1
-        )
-        best_place = placement
-        best = evaluate(trace, placement, mesh, params, args.routing_strategy, args.capacity_factor, include_shared, show_progress=args.progress, label="eval", origin_mode=args.origin_mode, seed=args.seed)
-        print(
-            f"anneal[{args.objective}]: mean={best['mean']:.4f} p95={best['p95']:.4f} p99={best['p99']:.4f} "
-            f"dispatch={best.get('max_dispatch_mean', 0.0):.4f} "
-            f"compute={best.get('max_compute_mean', 0.0):.4f} "
-            f"combine={best.get('max_combine_mean', 0.0):.4f}"
-        )
-    elif args.search == "row-balance":
-        replica_rows = row_first_balance(replication, counts, mesh, max_per_device)
-        if shared_row_list:
-            replica_rows[256] = shared_row_list
-        placement = place_within_rows(replica_rows, mesh, max_per_device)
-        best_place = placement
-        best = evaluate(trace, placement, mesh, params, args.routing_strategy, args.capacity_factor, include_shared, show_progress=args.progress, label="eval", origin_mode=args.origin_mode, seed=args.seed)
-        print(
-            f"row-balance[{args.objective}]: mean={best['mean']:.4f} p95={best['p95']:.4f} p99={best['p99']:.4f} "
-            f"dispatch={best.get('max_dispatch_mean', 0.0):.4f} "
-            f"compute={best.get('max_compute_mean', 0.0):.4f} "
-            f"combine={best.get('max_combine_mean', 0.0):.4f}"
-        )
-    elif args.search == "hot-tier":
-        replica_rows = hot_tier_partition(replication, counts, coact, mesh, max_per_device, top_n=32)
-        if shared_row_list:
-            replica_rows[256] = shared_row_list
-        placement = place_within_rows(replica_rows, mesh, max_per_device)
-        best_place = placement
-        best = evaluate(trace, placement, mesh, params, args.routing_strategy, args.capacity_factor, include_shared, show_progress=args.progress, label="eval", origin_mode=args.origin_mode, seed=args.seed)
-        print(
-            f"hot-tier[{args.objective}]: mean={best['mean']:.4f} p95={best['p95']:.4f} p99={best['p99']:.4f} "
-            f"dispatch={best.get('max_dispatch_mean', 0.0):.4f} "
-            f"compute={best.get('max_compute_mean', 0.0):.4f} "
-            f"combine={best.get('max_combine_mean', 0.0):.4f}"
-        )
-    else:
-        for i in range(args.iters):
-            placement = random_placement(replication, mesh, max_per_device)
-            score = evaluate(trace, placement, mesh, params, args.routing_strategy, args.capacity_factor, include_shared, show_progress=args.progress, label=f"eval {i}", origin_mode=args.origin_mode, seed=args.seed)
+        return score, placement
+
+    for r_idx in range(max(1, args.restarts)):
+        if args.restarts > 1:
+            print(f"restart {r_idx + 1}/{args.restarts}")
+        random.seed(args.seed + r_idx)
+
+        if args.search == "row-aware":
+            replica_rows = row_partition(replication, counts, coact, mesh, max_per_device)
+            if shared_row_list:
+                replica_rows[256] = shared_row_list
+            placement = place_within_rows(replica_rows, mesh, max_per_device)
+            placement = local_search(
+                trace, placement, mesh, params,
+                routing_strategy=args.routing_strategy,
+                capacity_factor=args.capacity_factor,
+                include_shared=include_shared,
+                objective=args.objective,
+                iters=args.local_search_iters,
+            )
+            score, placement = _evaluate_and_print("row-aware", placement, args.seed + r_idx)
+        elif args.search == "anneal":
+            replica_rows = row_partition(replication, counts, coact, mesh, max_per_device)
+            if shared_row_list:
+                replica_rows[256] = shared_row_list
+            placement = place_within_rows(replica_rows, mesh, max_per_device)
+            placement = simulated_annealing(
+                trace, placement, mesh, params,
+                routing_strategy=args.routing_strategy,
+                capacity_factor=args.capacity_factor,
+                include_shared=include_shared,
+                objective=args.objective,
+                iters=args.anneal_iters, t0=args.anneal_t0, t1=args.anneal_t1
+            )
+            score, placement = _evaluate_and_print("anneal", placement, args.seed + r_idx)
+        elif args.search == "row-balance":
+            replica_rows = row_first_balance(replication, counts, mesh, max_per_device)
+            if shared_row_list:
+                replica_rows[256] = shared_row_list
+            placement = place_within_rows(replica_rows, mesh, max_per_device)
+            score, placement = _evaluate_and_print("row-balance", placement, args.seed + r_idx)
+        elif args.search == "hot-tier":
+            replica_rows = hot_tier_partition(replication, counts, coact, mesh, max_per_device, top_n=32)
+            if shared_row_list:
+                replica_rows[256] = shared_row_list
+            placement = place_within_rows(replica_rows, mesh, max_per_device)
+            score, placement = _evaluate_and_print("hot-tier", placement, args.seed + r_idx)
+        elif args.search == "hybrid":
+            replica_rows = row_first_balance(replication, counts, mesh, max_per_device)
+            if shared_row_list:
+                replica_rows[256] = shared_row_list
+            placement = place_within_rows(replica_rows, mesh, max_per_device)
+            placement = local_search(
+                trace, placement, mesh, params,
+                routing_strategy=args.routing_strategy,
+                capacity_factor=args.capacity_factor,
+                include_shared=include_shared,
+                objective=args.objective,
+                iters=args.local_search_iters,
+            )
+            placement = simulated_annealing(
+                trace, placement, mesh, params,
+                routing_strategy=args.routing_strategy,
+                capacity_factor=args.capacity_factor,
+                include_shared=include_shared,
+                objective=args.objective,
+                iters=args.anneal_iters, t0=args.anneal_t0, t1=args.anneal_t1
+            )
+            placement = local_search(
+                trace, placement, mesh, params,
+                routing_strategy=args.routing_strategy,
+                capacity_factor=args.capacity_factor,
+                include_shared=include_shared,
+                objective=args.objective,
+                iters=max(50, args.local_search_iters // 2),
+            )
+            score, placement = _evaluate_and_print("hybrid", placement, args.seed + r_idx)
+        else:
+            score = None
+            placement = None
+            for i in range(args.iters):
+                cand = random_placement(replication, mesh, max_per_device)
+                cand_score = evaluate(trace, cand, mesh, params, args.routing_strategy, args.capacity_factor, include_shared, show_progress=args.progress, label=f"eval {i}", origin_mode=args.origin_mode, seed=args.seed + r_idx)
+                if score is None or cand_score[args.objective] < score[args.objective]:
+                    score = cand_score
+                    placement = cand
+                print(
+                    f"iter {i}[{args.objective}]: mean={cand_score['mean']:.4f} p95={cand_score['p95']:.4f} p99={cand_score['p99']:.4f} "
+                    f"dispatch={cand_score.get('max_dispatch_mean', 0.0):.4f} "
+                    f"compute={cand_score.get('max_compute_mean', 0.0):.4f} "
+                    f"combine={cand_score.get('max_combine_mean', 0.0):.4f}"
+                )
+            # re-print best for random
+            if score is not None and placement is not None:
+                print(
+                    f"random-best[{args.objective}]: mean={score['mean']:.4f} p95={score['p95']:.4f} p99={score['p99']:.4f} "
+                    f"dispatch={score.get('max_dispatch_mean', 0.0):.4f} "
+                    f"compute={score.get('max_compute_mean', 0.0):.4f} "
+                    f"combine={score.get('max_combine_mean', 0.0):.4f}"
+                )
+
+        if score is not None and placement is not None:
             if best is None or score[args.objective] < best[args.objective]:
                 best = score
                 best_place = placement
-            print(
-                f"iter {i}[{args.objective}]: mean={score['mean']:.4f} p95={score['p95']:.4f} p99={score['p99']:.4f} "
-                f"dispatch={score.get('max_dispatch_mean', 0.0):.4f} "
-                f"compute={score.get('max_compute_mean', 0.0):.4f} "
-                f"combine={score.get('max_combine_mean', 0.0):.4f}"
-            )
 
     print("best:", best)
     if best_place:
@@ -784,6 +834,19 @@ def main() -> None:
         placement_path = os.path.join(out_dir, "placement.json")
         with open(placement_path, "w", encoding="utf-8") as f:
             json.dump(best_place.expert_replicas, f, indent=2)
+
+        # Save eval summary
+        if best is not None:
+            eval_path = os.path.join(out_dir, "eval.md")
+            with open(eval_path, "w", encoding="utf-8") as f:
+                f.write("# Search Evaluation Summary\n\n")
+                f.write(f"- objective: {args.objective}\n")
+                f.write(f"- mean: {best.get('mean', 0.0):.4f}\n")
+                f.write(f"- p95: {best.get('p95', 0.0):.4f}\n")
+                f.write(f"- p99: {best.get('p99', 0.0):.4f}\n")
+                f.write(f"- dispatch_mean: {best.get('max_dispatch_mean', 0.0):.4f}\n")
+                f.write(f"- compute_mean: {best.get('max_compute_mean', 0.0):.4f}\n")
+                f.write(f"- combine_mean: {best.get('max_combine_mean', 0.0):.4f}\n")
 
         # Save expert frequency table (layer x expert instance)
         freq_csv = os.path.join(out_dir, "expert_frequency.csv")

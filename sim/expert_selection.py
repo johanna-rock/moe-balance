@@ -103,6 +103,8 @@ def balanced_expert_selection_replicas(
     for token_id in range(batch):
         for token_rank in range(k):
             expert_id = topk_experts[token_id][token_rank]
+            if expert_id < 0 or expert_id >= len(expert_id_mapping):
+                raise AssertionError(f"expert_id out of range: {expert_id} (mapping size {len(expert_id_mapping)})")
             replicas = expert_id_mapping[expert_id]
             chosen = -1
             for rep_id in replicas:
