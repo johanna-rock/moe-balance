@@ -1,0 +1,4 @@
+{
+  // Initial placement parameters
+  "no_shared_expert_row_replication": false // disable shared expert row replication when true
+}

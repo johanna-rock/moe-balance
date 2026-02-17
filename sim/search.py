@@ -149,19 +149,21 @@ def load_trace(path: str, layer: int, max_records: int = 0, show_progress: bool 
 
 
 def initial_replication(expert_counts: List[int], total_slots: int,
-                        shared_id: Optional[int] = None, shared_replicas: int = 0) -> Dict[int, int]:
+                        shared_ids: Optional[List[int]] = None, shared_replicas: int = 0) -> Dict[int, int]:
     # Allocate at least 1 slot per expert, then assign extra by frequency.
     # shared_replicas is the TOTAL replicas for the shared expert (e.g., 16 = 1 base + 15 extra).
     n = len(expert_counts)
     slots = [1 for _ in range(n)]
-    if shared_id is not None and 0 <= shared_id < n and shared_replicas > 0:
-        slots[shared_id] = shared_replicas
+    if shared_ids and shared_replicas > 0:
+        for shared_id in shared_ids:
+            if 0 <= shared_id < n:
+                slots[shared_id] = shared_replicas
     remaining = total_slots - sum(slots)
     if remaining <= 0:
         return {i: slots[i] for i in range(n)}
     # greedy by counts (ignore shared expert for extra replicas)
     order = sorted(
-        [i for i in range(n) if i != shared_id],
+        [i for i in range(n) if not shared_ids or i not in shared_ids],
         key=lambda i: expert_counts[i],
         reverse=True,
     )
@@ -175,26 +177,39 @@ def initial_replication(expert_counts: List[int], total_slots: int,
 
 def random_placement(replication: Dict[int, int], mesh: Mesh, max_per_device: int) -> Placement:
     num_devices = mesh.rows * mesh.cols
-    device_load = [0 for _ in range(num_devices)]
-    expert_replicas: Dict[int, List[int]] = {}
+    total_capacity = num_devices * max_per_device
+    total_replicas = sum(replication.values())
+    if total_replicas > total_capacity:
+        raise SystemExit("Not enough device capacity for random placement")
+
+    # Build a list of all replica slots to place (one entry per replica).
+    replicas = []
     for expert, reps in replication.items():
-        # sample devices with available capacity
-        choices = [i for i in range(num_devices) if device_load[i] < max_per_device]
-        if len(choices) < reps:
-            raise SystemExit("Not enough device capacity for random placement")
-        selected = random.sample(choices, reps)
-        expert_replicas[expert] = selected
-        for did in selected:
-            device_load[did] += 1
+        replicas.extend([expert] * reps)
+    random.shuffle(replicas)
+
+    # Build a list of device slots (each device repeated by its capacity).
+    device_slots = []
+    for did in range(num_devices):
+        device_slots.extend([did] * max_per_device)
+    random.shuffle(device_slots)
+
+    expert_replicas: Dict[int, List[int]] = {}
+    for expert, did in zip(replicas, device_slots):
+        expert_replicas.setdefault(expert, []).append(did)
+
     return Placement(expert_replicas)
 
 
-def build_coact_matrix(trace: List[Dict], experts: int, include_shared: bool = False, shared_id: int = 256) -> List[List[int]]:
+def build_coact_matrix(trace: List[Dict], experts: int, include_shared: bool = False,
+                       shared_ids: Optional[List[int]] = None) -> List[List[int]]:
     coact = [[0 for _ in range(experts)] for _ in range(experts)]
     for rec in trace:
         for experts_list in rec["topk_experts"]:
-            if include_shared and shared_id < experts:
-                experts_list = list(experts_list) + [shared_id]
+            if include_shared and shared_ids:
+                extras = [sid for sid in shared_ids if sid < experts]
+                if extras:
+                    experts_list = list(experts_list) + extras
             for i in range(len(experts_list)):
                 ei = experts_list[i]
                 for j in range(i + 1, len(experts_list)):
@@ -420,7 +435,8 @@ def local_search(trace: List[Dict], placement: Placement, mesh: Mesh,
                  params: CostParams, routing_strategy: str, capacity_factor: float,
                  include_shared: bool, objective: str, iters: int = 200,
                  show_progress: bool = False, label: str = "local_search",
-                 profile_eval: bool = False) -> Placement:
+                 profile_eval: bool = False,
+                 shared_ids: Optional[List[int]] = None) -> Placement:
     best = placement
     best_score = evaluate(
         trace,
@@ -431,6 +447,7 @@ def local_search(trace: List[Dict], placement: Placement, mesh: Mesh,
         capacity_factor,
         include_shared,
         profile_eval=profile_eval and not show_progress,
+        shared_ids=shared_ids,
     )[objective]
     device_map = placement_to_device_map(best)
     device_ids = list(range(mesh.rows * mesh.cols))
@@ -462,6 +479,7 @@ def local_search(trace: List[Dict], placement: Placement, mesh: Mesh,
             capacity_factor,
             include_shared,
             profile_eval=profile_eval and not show_progress,
+            shared_ids=shared_ids,
         )[objective]
         if score < best_score:
             best_score = score
@@ -483,7 +501,8 @@ def simulated_annealing(trace: List[Dict], placement: Placement, mesh: Mesh,
                         include_shared: bool, objective: str,
                         iters: int = 500, t0: float = 1.0, t1: float = 0.01,
                         show_progress: bool = False, label: str = "anneal",
-                        profile_eval: bool = False) -> Placement:
+                        profile_eval: bool = False,
+                        shared_ids: Optional[List[int]] = None) -> Placement:
     current = placement
     current_score = evaluate(
         trace,
@@ -494,6 +513,7 @@ def simulated_annealing(trace: List[Dict], placement: Placement, mesh: Mesh,
         capacity_factor,
         include_shared,
         profile_eval=profile_eval and not show_progress,
+        shared_ids=shared_ids,
     )[objective]
     best = current
     best_score = current_score
@@ -530,6 +550,7 @@ def simulated_annealing(trace: List[Dict], placement: Placement, mesh: Mesh,
             capacity_factor,
             include_shared,
             profile_eval=profile_eval and not show_progress,
+            shared_ids=shared_ids,
         )[objective]
         delta = score - current_score
         if delta <= 0 or random.random() < math.exp(-delta / max(1e-9, t)):
@@ -570,13 +591,19 @@ def build_instance_mapping(placement: Placement) -> Dict[str, object]:
     }
 
 
-def _add_shared_expert(topk_experts: List[List[int]], shared_id: int) -> List[List[int]]:
+def _add_shared_experts(topk_experts: List[List[int]], shared_ids: List[int]) -> List[List[int]]:
+    if not shared_ids:
+        return topk_experts
     out = []
+    shared_set = set(shared_ids)
     for experts in topk_experts:
-        if experts and experts[-1] == shared_id:
-            out.append(experts)
-        else:
-            out.append(list(experts) + [shared_id])
+        cur = list(experts)
+        for sid in shared_ids:
+            if sid not in shared_set:
+                continue
+            if sid not in cur:
+                cur.append(sid)
+        out.append(cur)
     return out
 
 
@@ -597,7 +624,8 @@ def _avg_results(results: List[Dict[str, float]]) -> Dict[str, float]:
 
 
 def write_expert_frequency_csv(trace: List[Dict], placement: Placement, total_experts: int,
-                               include_shared: bool, out_path: str) -> None:
+                               include_shared: bool, out_path: str,
+                               shared_ids: Optional[List[int]] = None) -> None:
     mapping = build_instance_mapping(placement)
     instance_to_original = mapping.get("instance_to_original")
     if instance_to_original is None:
@@ -609,8 +637,8 @@ def write_expert_frequency_csv(trace: List[Dict], placement: Placement, total_ex
     for rec in trace:
         layer = rec.get("layer", 0)
         topk = rec.get("topk_experts", [])
-        if include_shared:
-            topk = _add_shared_expert(topk, shared_id=256)
+        if include_shared and shared_ids:
+            topk = _add_shared_experts(topk, shared_ids)
         layer_counts.setdefault(layer, [0 for _ in range(total_experts)])
         for experts in topk:
             for e in experts:
@@ -629,7 +657,8 @@ def evaluate(trace: List[Dict], placement: Placement, mesh: Mesh, params: CostPa
              routing_strategy: str, capacity_factor: float, include_shared: bool,
              show_progress: bool = False, label: str = "eval",
              origin_mode: str = "average-rows", seed: int = 0,
-             profile_eval: bool = False) -> Dict[str, float]:
+             profile_eval: bool = False,
+             shared_ids: Optional[List[int]] = None) -> Dict[str, float]:
     if routing_strategy != "balanced-replicas":
         raise AssertionError("routing_strategy must be balanced-replicas (instance ids required by cost model)")
     results = []
@@ -642,8 +671,8 @@ def evaluate(trace: List[Dict], placement: Placement, mesh: Mesh, params: CostPa
     start_time = time.perf_counter()
     for idx, rec in enumerate(trace):
         topk = rec["topk_experts"]
-        if include_shared:
-            topk = _add_shared_expert(topk, shared_id=256)
+        if include_shared and shared_ids:
+            topk = _add_shared_experts(topk, shared_ids)
         origin_rows = rec.get("origin_rows", [])
         num_tokens = len(topk)
         if not origin_rows:
@@ -726,6 +755,7 @@ def main() -> None:
     ap.add_argument("--search", choices=["random", "row-aware", "anneal", "row-balance", "hot-tier", "hybrid"], default="row-balance")
     ap.add_argument("--search-config", default="", help="JSON file with search-specific parameters")
     ap.add_argument("--system-config", default="", help="JSON file with system/dataset parameters")
+    ap.add_argument("--initial-placement-config", default="", help="JSON file with initial placement parameters")
     ap.add_argument("--local-search-iters", type=int, default=200)
     ap.add_argument("--local-search-final-iters", type=int, default=10, help="Final local search iters")
     ap.add_argument("--anneal-iters", type=int, default=500)
@@ -738,11 +768,10 @@ def main() -> None:
     ap.add_argument("--coact-csv", default="", help="Write co-activation matrix to CSV")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-records", type=int, default=0, help="Limit number of trace records (0 = no limit)")
-    ap.add_argument("--progress", action="store_true", default=True, help="Show approximate progress while loading/evaluating trace")
     ap.add_argument("--coact-only", action="store_true", help="Only write co-activation CSV and exit")
     ap.add_argument("--routing-strategy", choices=["least-loaded", "balanced-replicas"], default="least-loaded")
     ap.add_argument("--capacity-factor", type=float, default=2.0)
-    ap.add_argument("--no-shared-expert", action="store_true", help="Disable shared expert (id=256)")
+    ap.add_argument("--num-shared-experts", type=int, default=1, help="Number of shared experts to append")
     ap.add_argument("--no-shared-expert-row-replication", action="store_true",
                     help="Disable shared expert row-first replication placement")
     ap.add_argument("--objective", choices=["mean", "p95", "p99"], default="mean")
@@ -762,6 +791,7 @@ def main() -> None:
             "cols",
             "experts",
             "slots",
+            "num_shared_experts",
             "routing_strategy",
             "capacity_factor",
             "objective",
@@ -774,6 +804,14 @@ def main() -> None:
         if unknown:
             raise SystemExit(f"--system-config has unknown keys: {', '.join(unknown)}")
         for k, v in sys_cfg.items():
+            setattr(args, k, v)
+    if args.initial_placement_config:
+        init_cfg = _load_jsonc(args.initial_placement_config)
+        allowed = {"no_shared_expert_row_replication"}
+        unknown = [k for k in init_cfg.keys() if k not in allowed]
+        if unknown:
+            raise SystemExit(f"--initial-placement-config has unknown keys: {', '.join(unknown)}")
+        for k, v in init_cfg.items():
             setattr(args, k, v)
     if not args.trace:
         raise SystemExit("--trace or --system-config with trace is required")
@@ -800,10 +838,31 @@ def main() -> None:
         # Apply config values
         for k, v in search_config.items():
             setattr(args, k, v)
-    # Print full configuration (including defaults)
+    # Print grouped configuration (including defaults)
     print("search config:", file=sys.stderr)
-    for k, v in sorted(vars(args).items()):
-        print(f"  {k}: {v}", file=sys.stderr)
+    sys_keys = [
+        "trace", "layer", "rows", "cols", "experts", "num_shared_experts", "slots",
+        "routing_strategy", "capacity_factor", "objective", "origin_mode",
+        "max_records", "fast_test_pct", "max_seq_len",
+    ]
+    init_keys = ["no_shared_expert_row_replication"]
+    search_keys = [
+        "search", "iters", "local_search_iters", "local_search_final_iters",
+        "anneal_iters", "anneal_t0", "anneal_t1", "restarts",
+    ]
+    misc_keys = [
+        "seed", "coact_csv", "coact_only", "plot_only", "profile_eval", "save_placement",
+        "system_config", "initial_placement_config", "search_config",
+    ]
+    def _print_group(title: str, keys: List[str]) -> None:
+        print(f"\n{title}:", file=sys.stderr)
+        for k in keys:
+            if hasattr(args, k):
+                print(f"  {k}: {getattr(args, k)}", file=sys.stderr)
+    _print_group("system", sys_keys)
+    _print_group("initial_placement", init_keys)
+    _print_group("search", search_keys)
+    _print_group("misc", misc_keys)
 
     # Plot-only mode: validate config and render plots without running search.
     if args.plot_only:
@@ -831,7 +890,7 @@ def main() -> None:
             "capacity_factor": args.capacity_factor,
             "objective": args.objective,
             "origin_mode": args.origin_mode,
-            "include_shared": not args.no_shared_expert,
+            "num_shared_experts": args.num_shared_experts,
             "shared_row_replication": not args.no_shared_expert_row_replication,
         }
         for k, v in expected.items():
@@ -860,14 +919,15 @@ def main() -> None:
                 args.trace,
                 args.layer,
                 max_records=args.max_records,
-                show_progress=args.progress,
+                show_progress=True,
                 fast_test_pct=args.fast_test_pct,
                 seed=args.seed,
                 max_seq_len=args.max_seq_len,
             )
-            include_shared = not args.no_shared_expert
-            total_experts = args.experts + (1 if include_shared else 0)
-            write_expert_frequency_csv(trace, placement_data, total_experts, include_shared, freq_csv)
+            include_shared = args.num_shared_experts > 0
+            total_experts = args.experts + max(0, args.num_shared_experts)
+            shared_ids = list(range(args.experts, args.experts + max(0, args.num_shared_experts)))
+            write_expert_frequency_csv(trace, placement_data, total_experts, include_shared, freq_csv, shared_ids=shared_ids)
         subprocess.run(plot_cmd, check=False)
         subprocess.run(plot_cmd_base, check=False)
         return
@@ -877,25 +937,26 @@ def main() -> None:
         args.trace,
         args.layer,
         max_records=args.max_records,
-        show_progress=args.progress,
+        show_progress=True,
         fast_test_pct=args.fast_test_pct,
         seed=args.seed,
         max_seq_len=args.max_seq_len,
     )
 
     # Count expert usage for replication
-    include_shared = not args.no_shared_expert
-    total_experts = args.experts + (1 if include_shared else 0)
+    include_shared = args.num_shared_experts > 0
+    total_experts = args.experts + max(0, args.num_shared_experts)
+    shared_ids = list(range(args.experts, args.experts + max(0, args.num_shared_experts)))
     counts = [0 for _ in range(total_experts)]
     for rec in trace:
         topk = rec["topk_experts"]
-        if include_shared:
-            topk = _add_shared_expert(topk, shared_id=256)
+        if include_shared and shared_ids:
+            topk = _add_shared_experts(topk, shared_ids)
         for experts in topk:
             for e in experts:
                 counts[e] += 1
 
-    replication = initial_replication(counts, args.slots, shared_id=256 if include_shared else None, shared_replicas=16)
+    replication = initial_replication(counts, args.slots, shared_ids=shared_ids if include_shared else None, shared_replicas=16)
     # Compute:comm ratio = 1:3 (comm is 3x slower than compute for same token count).
     coeffs = calibrate_dispatch_coeffs(mesh.rows)
     params = CostParams(
@@ -908,7 +969,7 @@ def main() -> None:
     best = None
     best_place = None
 
-    coact = build_coact_matrix(trace, total_experts, include_shared=include_shared, shared_id=256)
+    coact = build_coact_matrix(trace, total_experts, include_shared=include_shared, shared_ids=shared_ids)
     if args.coact_csv:
         write_coact_csv(coact, args.coact_csv)
         if args.coact_only:
@@ -917,10 +978,12 @@ def main() -> None:
 
     shared_devices = None
     if include_shared and not args.no_shared_expert_row_replication:
-        shared_reps = replication.get(256, 0)
-        shared_devices = shared_expert_row_replication(mesh, shared_reps)
-        if shared_devices:
-            shared_row_list = [mesh.devices()[did].row for did in shared_devices]
+        shared_row_list = []
+        for sid in shared_ids:
+            shared_reps = replication.get(sid, 0)
+            shared_devices = shared_expert_row_replication(mesh, shared_reps)
+            if shared_devices:
+                shared_row_list.extend([mesh.devices()[did].row for did in shared_devices])
     else:
         shared_row_list = []
 
@@ -940,6 +1003,7 @@ def main() -> None:
             origin_mode=args.origin_mode,
             seed=seed,
             profile_eval=False,
+            shared_ids=shared_ids,
         )
         print(
             f"{label}[{args.objective}]: mean={score['mean']:.4f} p95={score['p95']:.4f} p99={score['p99']:.4f} "
@@ -958,7 +1022,8 @@ def main() -> None:
         if args.search == "row-aware":
             replica_rows = row_partition(replication, counts, coact, mesh, max_per_device)
             if shared_row_list:
-                replica_rows[256] = shared_row_list
+                for sid in shared_ids:
+                    replica_rows[sid] = shared_row_list
             placement = place_within_rows(replica_rows, mesh, max_per_device)
             placement = local_search(
                 trace, placement, mesh, params,
@@ -967,15 +1032,17 @@ def main() -> None:
                 include_shared=include_shared,
                 objective=args.objective,
                 iters=args.local_search_iters,
-                show_progress=args.progress,
+                show_progress=True,
                 label="local_search",
                 profile_eval=args.profile_eval,
+                shared_ids=shared_ids,
             )
             score, placement = _evaluate_and_print("row-aware", placement, args.seed + r_idx)
         elif args.search == "anneal":
             replica_rows = row_partition(replication, counts, coact, mesh, max_per_device)
             if shared_row_list:
-                replica_rows[256] = shared_row_list
+                for sid in shared_ids:
+                    replica_rows[sid] = shared_row_list
             placement = place_within_rows(replica_rows, mesh, max_per_device)
             placement = simulated_annealing(
                 trace, placement, mesh, params,
@@ -984,27 +1051,31 @@ def main() -> None:
                 include_shared=include_shared,
                 objective=args.objective,
                 iters=args.anneal_iters, t0=args.anneal_t0, t1=args.anneal_t1,
-                show_progress=args.progress,
+                show_progress=True,
                 label="anneal",
                 profile_eval=args.profile_eval,
+                shared_ids=shared_ids,
             )
             score, placement = _evaluate_and_print("anneal", placement, args.seed + r_idx)
         elif args.search == "row-balance":
             replica_rows = row_first_balance(replication, counts, mesh, max_per_device)
             if shared_row_list:
-                replica_rows[256] = shared_row_list
+                for sid in shared_ids:
+                    replica_rows[sid] = shared_row_list
             placement = place_within_rows(replica_rows, mesh, max_per_device)
             score, placement = _evaluate_and_print("row-balance", placement, args.seed + r_idx)
         elif args.search == "hot-tier":
             replica_rows = hot_tier_partition(replication, counts, coact, mesh, max_per_device, top_n=32)
             if shared_row_list:
-                replica_rows[256] = shared_row_list
+                for sid in shared_ids:
+                    replica_rows[sid] = shared_row_list
             placement = place_within_rows(replica_rows, mesh, max_per_device)
             score, placement = _evaluate_and_print("hot-tier", placement, args.seed + r_idx)
         elif args.search == "hybrid":
             replica_rows = row_first_balance(replication, counts, mesh, max_per_device)
             if shared_row_list:
-                replica_rows[256] = shared_row_list
+                for sid in shared_ids:
+                    replica_rows[sid] = shared_row_list
             placement = place_within_rows(replica_rows, mesh, max_per_device)
             placement = local_search(
                 trace, placement, mesh, params,
@@ -1013,9 +1084,10 @@ def main() -> None:
                 include_shared=include_shared,
                 objective=args.objective,
                 iters=args.local_search_iters,
-                show_progress=args.progress,
+                show_progress=True,
                 label="local_search",
                 profile_eval=args.profile_eval,
+                shared_ids=shared_ids,
             )
             placement = simulated_annealing(
                 trace, placement, mesh, params,
@@ -1024,9 +1096,10 @@ def main() -> None:
                 include_shared=include_shared,
                 objective=args.objective,
                 iters=args.anneal_iters, t0=args.anneal_t0, t1=args.anneal_t1,
-                show_progress=args.progress,
+                show_progress=True,
                 label="anneal",
                 profile_eval=args.profile_eval,
+                shared_ids=shared_ids,
             )
             placement = local_search(
                 trace, placement, mesh, params,
@@ -1035,9 +1108,10 @@ def main() -> None:
                 include_shared=include_shared,
                 objective=args.objective,
                 iters=args.local_search_final_iters,
-                show_progress=args.progress,
+                show_progress=True,
                 label="local_search2",
                 profile_eval=args.profile_eval,
+                shared_ids=shared_ids,
             )
             score, placement = _evaluate_and_print("hybrid", placement, args.seed + r_idx)
         else:
@@ -1054,18 +1128,19 @@ def main() -> None:
                     args.routing_strategy,
                     args.capacity_factor,
                     include_shared,
-                    show_progress=args.progress,
+                    show_progress=True,
                     label=f"eval {i}",
                     origin_mode=args.origin_mode,
                     seed=args.seed + r_idx,
                     profile_eval=args.profile_eval,
+                    shared_ids=shared_ids,
                 )
                 if score is None or cand_score[args.objective] < score[args.objective]:
                     score = cand_score
                     placement = cand
-                if args.progress and args.iters > 0:
+                if args.iters > 0:
                     frac = (i + 1) / args.iters
-                    elapsed = time.time() - start_time
+                    elapsed = time.perf_counter() - start_time
                     eta = (elapsed / frac - elapsed) if frac > 0 else 0.0
                     print(
                         f"\rrandom_search: {int(frac*100):3d}%  elapsed {_format_eta(elapsed)}  eta {_format_eta(eta)}",
@@ -1078,8 +1153,7 @@ def main() -> None:
                     f"compute={cand_score.get('max_compute_mean', 0.0):.4f} "
                     f"combine={cand_score.get('max_combine_mean', 0.0):.4f}"
                 )
-            if args.progress:
-                print("")
+            print("")
             # re-print best for random
             if score is not None and placement is not None:
                 print(
@@ -1107,7 +1181,7 @@ def main() -> None:
             if base == "processed":
                 base = os.path.basename(os.path.dirname(os.path.dirname(args.trace))) or "dataset"
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_dir = os.path.join("results", base, f"layer{args.layer}", ts)
+            out_dir = os.path.join("results", base, f"layer{args.layer}", args.search, ts)
 
         os.makedirs(out_dir, exist_ok=True)
 
@@ -1131,7 +1205,7 @@ def main() -> None:
 
         # Save expert frequency table (layer x expert instance)
         freq_csv = os.path.join(out_dir, "expert_frequency.csv")
-        write_expert_frequency_csv(trace, best_place, total_experts, include_shared, freq_csv)
+        write_expert_frequency_csv(trace, best_place, total_experts, include_shared, freq_csv, shared_ids=shared_ids)
 
         # Save run config
         commit = "unknown"
@@ -1152,10 +1226,11 @@ def main() -> None:
             "capacity_factor": args.capacity_factor,
             "objective": args.objective,
             "origin_mode": args.origin_mode,
-            "include_shared": not args.no_shared_expert,
+            "num_shared_experts": args.num_shared_experts,
             "shared_row_replication": not args.no_shared_expert_row_replication,
             "search_config": search_config,
             "system_config": args.system_config,
+            "initial_placement_config": args.initial_placement_config,
             "commit": commit,
         }
         with open(os.path.join(out_dir, "run_config.json"), "w", encoding="utf-8") as f:

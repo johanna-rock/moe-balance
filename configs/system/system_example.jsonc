@@ -4,7 +4,8 @@
   "layer": 15, // MoE layer to evaluate
   "rows": 16, // mesh rows (devices per column)
   "cols": 8, // mesh columns (devices per row)
-  "experts": 256, // number of gated experts (shared expert is added internally)
+  "experts": 256, // number of gated experts
+  "num_shared_experts": 1, // number of shared experts appended per token
   "slots": 384, // total expert replica slots across the mesh
 
   // Routing + objective

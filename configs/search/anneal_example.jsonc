@@ -4,7 +4,7 @@
   "search": "anneal", // simulated annealing swaps
 
   // Annealing parameters
-  "anneal_iters": 500, // number of swap steps
+  "anneal_iters": 2, // number of swap steps
   "anneal_t0": 1.0, // initial temperature
   "anneal_t1": 0.01, // final temperature
 
