@@ -5,6 +5,7 @@ import math
 import os
 import random
 import sys
+import time
 import subprocess
 from typing import Dict, List, Tuple, Optional
 
@@ -12,7 +13,21 @@ from cost_model import Mesh, Placement, CostParams, simulate_batch, simulate_bat
 from expert_selection import balanced_expert_selection_replicas
 
 
-def _print_progress(label: str, done: int, total: int) -> None:
+def _format_eta(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0
+    if seconds < 60:
+        return f"{seconds:0.1f}s"
+    m, s = divmod(seconds, 60)
+    m = int(m)
+    s = int(s)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:d}h{m:02d}m{s:02d}s"
+    return f"{m:02d}m{s:02d}s"
+
+
+def _print_progress(label: str, done: int, total: int, start_time: float) -> None:
     if total <= 0:
         return
     width = 40
@@ -20,15 +35,25 @@ def _print_progress(label: str, done: int, total: int) -> None:
     filled = int(width * frac)
     bar = "#" * filled + "-" * (width - filled)
     pct = int(frac * 100)
-    print(f"\r{label} [{bar}] {pct:3d}%", end="", file=sys.stderr, flush=True)
+    elapsed = time.perf_counter() - start_time
+    eta = (elapsed / frac - elapsed) if frac > 0 else 0.0
+    print(
+        f"\r{label} [{bar}] {pct:3d}%  elapsed { _format_eta(elapsed) }  eta { _format_eta(eta) }",
+        end="",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
-def load_trace(path: str, layer: int, max_records: int = 0, show_progress: bool = False) -> List[Dict]:
+def load_trace(path: str, layer: int, max_records: int = 0, show_progress: bool = False,
+               fast_test_pct: float = 0.0, seed: int = 0,
+               max_seq_len: int = 0) -> List[Dict]:
     batches = []
     total_bytes = os.path.getsize(path)
     bytes_read = 0
+    start_time = time.perf_counter()
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
+        for idx, line in enumerate(f):
             bytes_read += len(line.encode("utf-8"))
             rec = json.loads(line)
             if rec["layer"] == layer:
@@ -41,11 +66,26 @@ def load_trace(path: str, layer: int, max_records: int = 0, show_progress: bool 
                         "origin_rows": origin_rows,
                         "topk_experts": topk_experts,
                     }
+                if max_seq_len and max_seq_len > 0:
+                    rec = dict(rec)
+                    rec["topk_experts"] = rec.get("topk_experts", [])[:max_seq_len]
+                    if "origin_rows" in rec and rec["origin_rows"]:
+                        rec["origin_rows"] = rec["origin_rows"][:max_seq_len]
+                if fast_test_pct and 0.0 < fast_test_pct < 1.0:
+                    topk = rec.get("topk_experts", [])
+                    if topk:
+                        k = max(1, int(len(topk) * fast_test_pct))
+                        rng = random.Random(seed + idx)
+                        pick = sorted(rng.sample(range(len(topk)), k))
+                        rec = dict(rec)
+                        rec["topk_experts"] = [topk[i] for i in pick]
+                        if "origin_rows" in rec and rec["origin_rows"]:
+                            rec["origin_rows"] = [rec["origin_rows"][i] for i in pick]
                 batches.append(rec)
                 if max_records and len(batches) >= max_records:
                     break
             if show_progress:
-                _print_progress("load_trace", bytes_read, total_bytes)
+                _print_progress("load_trace", bytes_read, total_bytes, start_time)
     if show_progress:
         print("", file=sys.stderr)
     return batches
@@ -321,13 +361,27 @@ def device_map_to_placement(device_map: Dict[int, List[int]]) -> Placement:
 
 def local_search(trace: List[Dict], placement: Placement, mesh: Mesh,
                  params: CostParams, routing_strategy: str, capacity_factor: float,
-                 include_shared: bool, objective: str, iters: int = 200) -> Placement:
+                 include_shared: bool, objective: str, iters: int = 200,
+                 show_progress: bool = False, label: str = "local_search",
+                 profile_eval: bool = False) -> Placement:
     best = placement
-    best_score = evaluate(trace, best, mesh, params, routing_strategy, capacity_factor, include_shared)[objective]
+    best_score = evaluate(
+        trace,
+        best,
+        mesh,
+        params,
+        routing_strategy,
+        capacity_factor,
+        include_shared,
+        profile_eval=profile_eval and not show_progress,
+    )[objective]
     device_map = placement_to_device_map(best)
     device_ids = list(range(mesh.rows * mesh.cols))
 
-    for _ in range(iters):
+    start_time = time.perf_counter()
+    for i in range(iters):
+        if show_progress:
+            _print_progress(label, i + 1, iters, start_time)
         d1, d2 = random.sample(device_ids, 2)
         if not device_map.get(d1) or not device_map.get(d2):
             continue
@@ -342,7 +396,16 @@ def local_search(trace: List[Dict], placement: Placement, mesh: Mesh,
         device_map[d2].append(e1)
 
         candidate = device_map_to_placement(device_map)
-        score = evaluate(trace, candidate, mesh, params, routing_strategy, capacity_factor, include_shared)[objective]
+        score = evaluate(
+            trace,
+            candidate,
+            mesh,
+            params,
+            routing_strategy,
+            capacity_factor,
+            include_shared,
+            profile_eval=profile_eval and not show_progress,
+        )[objective]
         if score < best_score:
             best_score = score
             best = candidate
@@ -353,22 +416,38 @@ def local_search(trace: List[Dict], placement: Placement, mesh: Mesh,
             device_map[d1].append(e1)
             device_map[d2].append(e2)
 
+    if show_progress:
+        print("")
     return best
 
 
 def simulated_annealing(trace: List[Dict], placement: Placement, mesh: Mesh,
                         params: CostParams, routing_strategy: str, capacity_factor: float,
                         include_shared: bool, objective: str,
-                        iters: int = 500, t0: float = 1.0, t1: float = 0.01) -> Placement:
+                        iters: int = 500, t0: float = 1.0, t1: float = 0.01,
+                        show_progress: bool = False, label: str = "anneal",
+                        profile_eval: bool = False) -> Placement:
     current = placement
-    current_score = evaluate(trace, current, mesh, params, routing_strategy, capacity_factor, include_shared)[objective]
+    current_score = evaluate(
+        trace,
+        current,
+        mesh,
+        params,
+        routing_strategy,
+        capacity_factor,
+        include_shared,
+        profile_eval=profile_eval and not show_progress,
+    )[objective]
     best = current
     best_score = current_score
 
     device_map = placement_to_device_map(current)
     device_ids = list(range(mesh.rows * mesh.cols))
 
+    start_time = time.perf_counter()
     for i in range(iters):
+        if show_progress:
+            _print_progress(label, i + 1, iters, start_time)
         t = t0 * ((t1 / t0) ** (i / max(1, iters - 1)))
         d1, d2 = random.sample(device_ids, 2)
         if not device_map.get(d1) or not device_map.get(d2):
@@ -385,7 +464,16 @@ def simulated_annealing(trace: List[Dict], placement: Placement, mesh: Mesh,
         device_map[d2].append(e1)
 
         candidate = device_map_to_placement(device_map)
-        score = evaluate(trace, candidate, mesh, params, routing_strategy, capacity_factor, include_shared)[objective]
+        score = evaluate(
+            trace,
+            candidate,
+            mesh,
+            params,
+            routing_strategy,
+            capacity_factor,
+            include_shared,
+            profile_eval=profile_eval and not show_progress,
+        )[objective]
         delta = score - current_score
         if delta <= 0 or random.random() < math.exp(-delta / max(1e-9, t)):
             current = candidate
@@ -400,6 +488,8 @@ def simulated_annealing(trace: List[Dict], placement: Placement, mesh: Mesh,
             device_map[d1].append(e1)
             device_map[d2].append(e2)
 
+    if show_progress:
+        print("")
     return best
 
 
@@ -481,7 +571,8 @@ def write_expert_frequency_csv(trace: List[Dict], placement: Placement, total_ex
 def evaluate(trace: List[Dict], placement: Placement, mesh: Mesh, params: CostParams,
              routing_strategy: str, capacity_factor: float, include_shared: bool,
              show_progress: bool = False, label: str = "eval",
-             origin_mode: str = "average-rows", seed: int = 0) -> Dict[str, float]:
+             origin_mode: str = "average-rows", seed: int = 0,
+             profile_eval: bool = False) -> Dict[str, float]:
     if routing_strategy != "balanced-replicas":
         raise AssertionError("routing_strategy must be balanced-replicas (instance ids required by cost model)")
     results = []
@@ -491,6 +582,7 @@ def evaluate(trace: List[Dict], placement: Placement, mesh: Mesh, params: CostPa
     num_expert_instances = mapping["num_expert_instances"]
     total = len(trace)
     rng = random.Random(seed)
+    start_time = time.perf_counter()
     for idx, rec in enumerate(trace):
         topk = rec["topk_experts"]
         if include_shared:
@@ -539,7 +631,14 @@ def evaluate(trace: List[Dict], placement: Placement, mesh: Mesh, params: CostPa
         results.append(r)
         if show_progress and total > 0 and (idx % 10 == 0 or idx == total - 1):
             pct = int((idx + 1) / total * 100)
-            print(f"\r{label}: {pct:3d}%", end="", flush=True)
+            elapsed = time.perf_counter() - start_time
+            frac = (idx + 1) / total
+            eta = (elapsed / frac - elapsed) if frac > 0 else 0.0
+            print(
+                f"\r{label}: {pct:3d}%  elapsed {_format_eta(elapsed)}  eta {_format_eta(eta)}",
+                end="",
+                flush=True,
+            )
     if show_progress:
         print("")
     agg = aggregate(results)
@@ -548,6 +647,13 @@ def evaluate(trace: List[Dict], placement: Placement, mesh: Mesh, params: CostPa
         agg["max_dispatch_mean"] = sum(r["max_dispatch"] for r in results) / len(results)
         agg["max_compute_mean"] = sum(r["max_compute"] for r in results) / len(results)
         agg["max_combine_mean"] = sum(r["max_combine"] for r in results) / len(results)
+    if profile_eval:
+        elapsed = time.perf_counter() - start_time
+        print(
+            f"\n{label} done in {_format_eta(elapsed)} for {len(trace)} records",
+            file=sys.stderr,
+            flush=True,
+        )
     return agg
 
 
@@ -562,10 +668,14 @@ def main() -> None:
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--search", choices=["random", "row-aware", "anneal", "row-balance", "hot-tier", "hybrid"], default="row-balance")
     ap.add_argument("--local-search-iters", type=int, default=200)
+    ap.add_argument("--local-search-final-iters", type=int, default=10, help="Final local search iters")
     ap.add_argument("--anneal-iters", type=int, default=500)
     ap.add_argument("--anneal-t0", type=float, default=1.0)
     ap.add_argument("--anneal-t1", type=float, default=0.01)
     ap.add_argument("--restarts", type=int, default=1, help="Number of randomized restarts per search")
+    ap.add_argument("--fast-test-pct", type=float, default=0.0, help="Subsample tokens per record (0.01 = 1%)")
+    ap.add_argument("--max-seq-len", type=int, default=0, help="Cap tokens per record (0 = no cap)")
+    ap.add_argument("--profile-eval", action="store_true", help="Print timing for each evaluate call")
     ap.add_argument("--coact-csv", default="", help="Write co-activation matrix to CSV")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-records", type=int, default=0, help="Limit number of trace records (0 = no limit)")
@@ -583,6 +693,10 @@ def main() -> None:
     args = ap.parse_args()
 
     random.seed(args.seed)
+    # Print full configuration (including defaults)
+    print("search config:", file=sys.stderr)
+    for k, v in sorted(vars(args).items()):
+        print(f"  {k}: {v}", file=sys.stderr)
 
     # Plot-only mode: validate config and render plots without running search.
     if args.plot_only:
@@ -635,7 +749,15 @@ def main() -> None:
         # Ensure frequency CSV exists for plot-only runs.
         freq_csv = os.path.join(args.save_placement, "expert_frequency.csv")
         if not os.path.exists(freq_csv):
-            trace = load_trace(args.trace, args.layer, max_records=args.max_records, show_progress=args.progress)
+            trace = load_trace(
+                args.trace,
+                args.layer,
+                max_records=args.max_records,
+                show_progress=args.progress,
+                fast_test_pct=args.fast_test_pct,
+                seed=args.seed,
+                max_seq_len=args.max_seq_len,
+            )
             include_shared = not args.no_shared_expert
             total_experts = args.experts + (1 if include_shared else 0)
             write_expert_frequency_csv(trace, placement_data, total_experts, include_shared, freq_csv)
@@ -644,7 +766,15 @@ def main() -> None:
         return
 
     mesh = Mesh(args.rows, args.cols)
-    trace = load_trace(args.trace, args.layer, max_records=args.max_records, show_progress=args.progress)
+    trace = load_trace(
+        args.trace,
+        args.layer,
+        max_records=args.max_records,
+        show_progress=args.progress,
+        fast_test_pct=args.fast_test_pct,
+        seed=args.seed,
+        max_seq_len=args.max_seq_len,
+    )
 
     # Count expert usage for replication
     include_shared = not args.no_shared_expert
@@ -698,10 +828,11 @@ def main() -> None:
             args.routing_strategy,
             args.capacity_factor,
             include_shared,
-            show_progress=args.progress,
+            show_progress=False,
             label="eval",
             origin_mode=args.origin_mode,
             seed=seed,
+            profile_eval=False,
         )
         print(
             f"{label}[{args.objective}]: mean={score['mean']:.4f} p95={score['p95']:.4f} p99={score['p99']:.4f} "
@@ -712,6 +843,7 @@ def main() -> None:
         return score, placement
 
     for r_idx in range(max(1, args.restarts)):
+        restart_start = time.perf_counter()
         if args.restarts > 1:
             print(f"restart {r_idx + 1}/{args.restarts}")
         random.seed(args.seed + r_idx)
@@ -728,6 +860,9 @@ def main() -> None:
                 include_shared=include_shared,
                 objective=args.objective,
                 iters=args.local_search_iters,
+                show_progress=args.progress,
+                label="local_search",
+                profile_eval=args.profile_eval,
             )
             score, placement = _evaluate_and_print("row-aware", placement, args.seed + r_idx)
         elif args.search == "anneal":
@@ -741,7 +876,10 @@ def main() -> None:
                 capacity_factor=args.capacity_factor,
                 include_shared=include_shared,
                 objective=args.objective,
-                iters=args.anneal_iters, t0=args.anneal_t0, t1=args.anneal_t1
+                iters=args.anneal_iters, t0=args.anneal_t0, t1=args.anneal_t1,
+                show_progress=args.progress,
+                label="anneal",
+                profile_eval=args.profile_eval,
             )
             score, placement = _evaluate_and_print("anneal", placement, args.seed + r_idx)
         elif args.search == "row-balance":
@@ -768,6 +906,9 @@ def main() -> None:
                 include_shared=include_shared,
                 objective=args.objective,
                 iters=args.local_search_iters,
+                show_progress=args.progress,
+                label="local_search",
+                profile_eval=args.profile_eval,
             )
             placement = simulated_annealing(
                 trace, placement, mesh, params,
@@ -775,7 +916,10 @@ def main() -> None:
                 capacity_factor=args.capacity_factor,
                 include_shared=include_shared,
                 objective=args.objective,
-                iters=args.anneal_iters, t0=args.anneal_t0, t1=args.anneal_t1
+                iters=args.anneal_iters, t0=args.anneal_t0, t1=args.anneal_t1,
+                show_progress=args.progress,
+                label="anneal",
+                profile_eval=args.profile_eval,
             )
             placement = local_search(
                 trace, placement, mesh, params,
@@ -783,24 +927,52 @@ def main() -> None:
                 capacity_factor=args.capacity_factor,
                 include_shared=include_shared,
                 objective=args.objective,
-                iters=max(50, args.local_search_iters // 2),
+                iters=args.local_search_final_iters,
+                show_progress=args.progress,
+                label="local_search2",
+                profile_eval=args.profile_eval,
             )
             score, placement = _evaluate_and_print("hybrid", placement, args.seed + r_idx)
         else:
             score = None
             placement = None
+            start_time = time.time()
             for i in range(args.iters):
                 cand = random_placement(replication, mesh, max_per_device)
-                cand_score = evaluate(trace, cand, mesh, params, args.routing_strategy, args.capacity_factor, include_shared, show_progress=args.progress, label=f"eval {i}", origin_mode=args.origin_mode, seed=args.seed + r_idx)
+                cand_score = evaluate(
+                    trace,
+                    cand,
+                    mesh,
+                    params,
+                    args.routing_strategy,
+                    args.capacity_factor,
+                    include_shared,
+                    show_progress=args.progress,
+                    label=f"eval {i}",
+                    origin_mode=args.origin_mode,
+                    seed=args.seed + r_idx,
+                    profile_eval=args.profile_eval,
+                )
                 if score is None or cand_score[args.objective] < score[args.objective]:
                     score = cand_score
                     placement = cand
+                if args.progress and args.iters > 0:
+                    frac = (i + 1) / args.iters
+                    elapsed = time.time() - start_time
+                    eta = (elapsed / frac - elapsed) if frac > 0 else 0.0
+                    print(
+                        f"\rrandom_search: {int(frac*100):3d}%  elapsed {_format_eta(elapsed)}  eta {_format_eta(eta)}",
+                        end="",
+                        flush=True,
+                    )
                 print(
                     f"iter {i}[{args.objective}]: mean={cand_score['mean']:.4f} p95={cand_score['p95']:.4f} p99={cand_score['p99']:.4f} "
                     f"dispatch={cand_score.get('max_dispatch_mean', 0.0):.4f} "
                     f"compute={cand_score.get('max_compute_mean', 0.0):.4f} "
                     f"combine={cand_score.get('max_combine_mean', 0.0):.4f}"
                 )
+            if args.progress:
+                print("")
             # re-print best for random
             if score is not None and placement is not None:
                 print(
@@ -814,6 +986,8 @@ def main() -> None:
             if best is None or score[args.objective] < best[args.objective]:
                 best = score
                 best_place = placement
+        restart_elapsed = time.perf_counter() - restart_start
+        print(f"restart {r_idx + 1} done in {_format_eta(restart_elapsed)}")
 
     print("best:", best)
     if best_place:
@@ -826,7 +1000,7 @@ def main() -> None:
             if base == "processed":
                 base = os.path.basename(os.path.dirname(os.path.dirname(args.trace))) or "dataset"
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_dir = os.path.join("analysis_artifacts", f"{base}_layer{args.layer}_{ts}")
+            out_dir = os.path.join("results", base, f"layer{args.layer}", ts)
 
         os.makedirs(out_dir, exist_ok=True)
 
