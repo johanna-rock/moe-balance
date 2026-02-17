@@ -765,10 +765,8 @@ def main() -> None:
     ap.add_argument("--fast-test-pct", type=float, default=0.0, help="Subsample tokens per record (0.01 = 1%)")
     ap.add_argument("--max-seq-len", type=int, default=0, help="Cap tokens per record (0 = no cap)")
     ap.add_argument("--profile-eval", action="store_true", help="Print timing for each evaluate call")
-    ap.add_argument("--coact-csv", default="", help="Write co-activation matrix to CSV")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-records", type=int, default=0, help="Limit number of trace records (0 = no limit)")
-    ap.add_argument("--coact-only", action="store_true", help="Only write co-activation CSV and exit")
     ap.add_argument("--routing-strategy", choices=["least-loaded", "balanced-replicas"], default="least-loaded")
     ap.add_argument("--capacity-factor", type=float, default=2.0)
     ap.add_argument("--num-shared-experts", type=int, default=1, help="Number of shared experts to append")
@@ -780,8 +778,8 @@ def main() -> None:
     ap.add_argument("--plot-only", action="store_true", help="Only render plots from existing placement.json")
     args = ap.parse_args()
 
-    random.seed(args.seed)
     # Apply system config overrides.
+    sys_cfg = {}
     if args.system_config:
         sys_cfg = _load_jsonc(args.system_config)
         allowed = {
@@ -805,6 +803,7 @@ def main() -> None:
             raise SystemExit(f"--system-config has unknown keys: {', '.join(unknown)}")
         for k, v in sys_cfg.items():
             setattr(args, k, v)
+    init_cfg = {}
     if args.initial_placement_config:
         init_cfg = _load_jsonc(args.initial_placement_config)
         allowed = {"no_shared_expert_row_replication"}
@@ -838,6 +837,10 @@ def main() -> None:
         # Apply config values
         for k, v in search_config.items():
             setattr(args, k, v)
+
+    if args.search == "random" and args.seed == 0:
+        args.seed = random.SystemRandom().randint(1, 2**31 - 1)
+    random.seed(args.seed)
     # Print grouped configuration (including defaults)
     print("search config:", file=sys.stderr)
     sys_keys = [
@@ -851,7 +854,7 @@ def main() -> None:
         "anneal_iters", "anneal_t0", "anneal_t1", "restarts",
     ]
     misc_keys = [
-        "seed", "coact_csv", "coact_only", "plot_only", "profile_eval", "save_placement",
+        "seed", "plot_only", "profile_eval", "save_placement",
         "system_config", "initial_placement_config", "search_config",
     ]
     def _print_group(title: str, keys: List[str]) -> None:
@@ -970,11 +973,6 @@ def main() -> None:
     best_place = None
 
     coact = build_coact_matrix(trace, total_experts, include_shared=include_shared, shared_ids=shared_ids)
-    if args.coact_csv:
-        write_coact_csv(coact, args.coact_csv)
-        if args.coact_only:
-            print(f"wrote co-activation CSV to {args.coact_csv}")
-            return
 
     shared_devices = None
     if include_shared and not args.no_shared_expert_row_replication:
@@ -1228,9 +1226,12 @@ def main() -> None:
             "origin_mode": args.origin_mode,
             "num_shared_experts": args.num_shared_experts,
             "shared_row_replication": not args.no_shared_expert_row_replication,
-            "search_config": search_config,
+            "search_config": args.search_config,
+            "search_config_content": search_config,
             "system_config": args.system_config,
+            "system_config_content": sys_cfg,
             "initial_placement_config": args.initial_placement_config,
+            "initial_placement_config_content": init_cfg,
             "commit": commit,
         }
         with open(os.path.join(out_dir, "run_config.json"), "w", encoding="utf-8") as f:
