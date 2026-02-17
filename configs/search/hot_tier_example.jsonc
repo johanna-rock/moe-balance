@@ -4,5 +4,5 @@
   "search": "hot-tier", // place top-N experts in a hot tier
 
   // Number of randomized restarts
-  "restarts": 1 // repeat search with different seeds
+  "restarts": 2 // repeat search with different seeds
 }

@@ -4,8 +4,8 @@
   "search": "random", // random placements, keep best
 
   // Random search iterations
-  "iters": 2, // number of random placements to evaluate
+  "iters": 200, // number of random placements to evaluate
 
   // Number of randomized restarts
-  "restarts": 1 // repeat search with different seeds
+  "restarts": 2 // repeat search with different seeds
 }

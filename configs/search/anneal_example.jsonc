@@ -4,10 +4,10 @@
   "search": "anneal", // simulated annealing swaps
 
   // Annealing parameters
-  "anneal_iters": 2, // number of swap steps
+  "anneal_iters": 1000, // number of swap steps
   "anneal_t0": 1.0, // initial temperature
   "anneal_t1": 0.01, // final temperature
 
   // Number of randomized restarts
-  "restarts": 1 // repeat search with different seeds
+  "restarts": 2 // repeat search with different seeds
 }

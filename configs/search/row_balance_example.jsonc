@@ -4,5 +4,5 @@
   "search": "row-balance", // row-first + column-balance placement
 
   // Number of randomized restarts
-  "restarts": 1 // repeat search with different seeds
+  "restarts": 2 // repeat search with different seeds
 }
