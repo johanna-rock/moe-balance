@@ -27,6 +27,63 @@ def _format_eta(seconds: float) -> str:
     return f"{m:02d}m{s:02d}s"
 
 
+def _strip_jsonc(text: str) -> str:
+    out = []
+    in_string = False
+    escape = False
+    line_comment = False
+    block_comment = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < len(text) else ""
+        if line_comment:
+            if ch == "\n":
+                line_comment = False
+                out.append(ch)
+            i += 1
+            continue
+        if block_comment:
+            if ch == "*" and nxt == "/":
+                block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_string:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == "\"":
+                in_string = False
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            block_comment = True
+            i += 2
+            continue
+        if ch == "\"":
+            in_string = True
+            out.append(ch)
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _load_jsonc(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read()
+    return json.loads(_strip_jsonc(raw))
+
+
 def _print_progress(label: str, done: int, total: int, start_time: float) -> None:
     if total <= 0:
         return
@@ -659,7 +716,7 @@ def evaluate(trace: List[Dict], placement: Placement, mesh: Mesh, params: CostPa
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Search for a better MoE placement")
-    ap.add_argument("--trace", required=True)
+    ap.add_argument("--trace", default="")
     ap.add_argument("--layer", type=int, default=0)
     ap.add_argument("--rows", type=int, default=16)
     ap.add_argument("--cols", type=int, default=8)
@@ -667,6 +724,8 @@ def main() -> None:
     ap.add_argument("--slots", type=int, default=384)
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--search", choices=["random", "row-aware", "anneal", "row-balance", "hot-tier", "hybrid"], default="row-balance")
+    ap.add_argument("--search-config", default="", help="JSON file with search-specific parameters")
+    ap.add_argument("--system-config", default="", help="JSON file with system/dataset parameters")
     ap.add_argument("--local-search-iters", type=int, default=200)
     ap.add_argument("--local-search-final-iters", type=int, default=10, help="Final local search iters")
     ap.add_argument("--anneal-iters", type=int, default=500)
@@ -693,6 +752,54 @@ def main() -> None:
     args = ap.parse_args()
 
     random.seed(args.seed)
+    # Apply system config overrides.
+    if args.system_config:
+        sys_cfg = _load_jsonc(args.system_config)
+        allowed = {
+            "trace",
+            "layer",
+            "rows",
+            "cols",
+            "experts",
+            "slots",
+            "routing_strategy",
+            "capacity_factor",
+            "objective",
+            "origin_mode",
+            "max_records",
+            "fast_test_pct",
+            "max_seq_len",
+        }
+        unknown = [k for k in sys_cfg.keys() if k not in allowed]
+        if unknown:
+            raise SystemExit(f"--system-config has unknown keys: {', '.join(unknown)}")
+        for k, v in sys_cfg.items():
+            setattr(args, k, v)
+    if not args.trace:
+        raise SystemExit("--trace or --system-config with trace is required")
+    search_config = {}
+    required_by_search = {
+        "random": {"search", "iters", "restarts"},
+        "row-aware": {"search", "local_search_iters", "restarts"},
+        "row-balance": {"search", "restarts"},
+        "hot-tier": {"search", "restarts"},
+        "anneal": {"search", "anneal_iters", "anneal_t0", "anneal_t1", "restarts"},
+        "hybrid": {"search", "local_search_iters", "local_search_final_iters", "anneal_iters", "anneal_t0", "anneal_t1", "restarts"},
+    }
+    if args.search_config:
+        search_config = _load_jsonc(args.search_config)
+        if "search" not in search_config:
+            raise SystemExit("--search-config must include a 'search' field")
+        search_name = search_config["search"]
+        if search_name not in required_by_search:
+            raise SystemExit(f"--search-config has unknown search type: {search_name}")
+        required = required_by_search[search_name]
+        missing = [k for k in required if k not in search_config]
+        if missing:
+            raise SystemExit(f"--search-config missing required keys for {search_name}: {', '.join(missing)}")
+        # Apply config values
+        for k, v in search_config.items():
+            setattr(args, k, v)
     # Print full configuration (including defaults)
     print("search config:", file=sys.stderr)
     for k, v in sorted(vars(args).items()):
@@ -1047,6 +1154,8 @@ def main() -> None:
             "origin_mode": args.origin_mode,
             "include_shared": not args.no_shared_expert,
             "shared_row_replication": not args.no_shared_expert_row_replication,
+            "search_config": search_config,
+            "system_config": args.system_config,
             "commit": commit,
         }
         with open(os.path.join(out_dir, "run_config.json"), "w", encoding="utf-8") as f:

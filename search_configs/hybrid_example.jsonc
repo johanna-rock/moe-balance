@@ -1,0 +1,15 @@
+{
+  // Search type
+  // Row-balance initialization followed by local search, annealing, then a final local search refinement.
+  "search": "hybrid", // row-balance -> local_search -> anneal -> local_search
+
+  // Hybrid parameters
+  "local_search_iters": 5, // swap iterations in first local search
+  "local_search_final_iters": 10, // swap iterations in final local search
+  "anneal_iters": 10, // annealing iterations
+  "anneal_t0": 1.0, // initial temperature
+  "anneal_t1": 0.01, // final temperature
+
+  // Number of randomized restarts
+  "restarts": 2 // repeat search with different seeds
+}

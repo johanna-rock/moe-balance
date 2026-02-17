@@ -1,0 +1,20 @@
+{
+  // Dataset + system parameters
+  "trace": "data/Idavidrein_gpqa/processed/trace_no_origin_rows.jsonl", // JSONL trace file
+  "layer": 15, // MoE layer to evaluate
+  "rows": 16, // mesh rows (devices per column)
+  "cols": 8, // mesh columns (devices per row)
+  "experts": 256, // number of gated experts (shared expert is added internally)
+  "slots": 384, // total expert replica slots across the mesh
+
+  // Routing + objective
+  "routing_strategy": "balanced-replicas", // Options: balanced-replicas (capacity-aware replica selection)
+  "capacity_factor": 2.0, // capacity = int(capacity_factor * (batch*k/num_instances))
+  "objective": "mean", // optimize mean latency (options: mean, p95, p99)
+  "origin_mode": "round-robin", // origin row per token cycles 0..rows-1
+
+  // Optional limits to reduce eval runtime (0 = disabled)
+  "max_records": 0, // cap number of trace records
+  "fast_test_pct": 0.0, // subsample tokens per record (e.g. 0.01 = 1%)
+  "max_seq_len": 0 // cap tokens per record
+}

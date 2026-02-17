@@ -1,0 +1,11 @@
+{
+  // Search type
+  // Evaluates random placements and keeps the best.
+  "search": "random", // random placements, keep best
+
+  // Random search iterations
+  "iters": 50, // number of random placements to evaluate
+
+  // Number of randomized restarts
+  "restarts": 1 // repeat search with different seeds
+}
