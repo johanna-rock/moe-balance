@@ -175,11 +175,20 @@ def initial_replication(expert_counts: List[int], total_slots: int,
     return {i: slots[i] for i in range(n)}
 
 
-def random_placement(replication: Dict[int, int], mesh: Mesh, max_per_device: int) -> Placement:
+def random_placement(replication: Dict[int, int], mesh: Mesh, max_per_device: int, placement: Optional[Placement] = None) -> Placement:
     num_devices = mesh.rows * mesh.cols
     total_capacity = num_devices * max_per_device
     total_replicas = sum(replication.values())
-    if total_replicas > total_capacity:
+    used = 0
+    expert_replicas: Dict[int, List[int]] = {}
+    device_load = [0 for _ in range(num_devices)]
+    if placement is not None:
+        for e, devs in placement.expert_replicas.items():
+            expert_replicas[e] = list(devs)
+            for did in devs:
+                device_load[did] += 1
+                used += 1
+    if total_replicas + used > total_capacity:
         raise SystemExit("Not enough device capacity for random placement")
 
     # Build a list of all replica slots to place (one entry per replica).
@@ -188,13 +197,17 @@ def random_placement(replication: Dict[int, int], mesh: Mesh, max_per_device: in
         replicas.extend([expert] * reps)
     random.shuffle(replicas)
 
-    # Build a list of device slots (each device repeated by its capacity).
+    # Build a list of available device slots (each device repeated by remaining capacity).
     device_slots = []
     for did in range(num_devices):
-        device_slots.extend([did] * max_per_device)
+        remaining = max_per_device - device_load[did]
+        if remaining > 0:
+            device_slots.extend([did] * remaining)
     random.shuffle(device_slots)
 
-    expert_replicas: Dict[int, List[int]] = {}
+    if len(device_slots) < len(replicas):
+        raise SystemExit("Not enough device capacity for random placement")
+
     for expert, did in zip(replicas, device_slots):
         expert_replicas.setdefault(expert, []).append(did)
 
@@ -219,6 +232,67 @@ def build_coact_matrix(trace: List[Dict], experts: int, include_shared: bool = F
     return coact
 
 
+def row_capacity_from_shared(mesh: Mesh, max_per_device: int, placement: Optional[Placement]) -> List[int]:
+    rows, cols = mesh.rows, mesh.cols
+    row_capacity = [max_per_device * cols for _ in range(rows)]
+    if placement is None:
+        return row_capacity
+    for devs in placement.expert_replicas.values():
+        for did in devs:
+            r = did // cols
+            row_capacity[r] -= 1
+    for r, cap in enumerate(row_capacity):
+        if cap < 0:
+            raise SystemExit(f"Row {r} over capacity after shared placement")
+    return row_capacity
+
+
+
+def parse_search_sequence(value, default_t0=1.0, default_t1=0.01):
+    if not value:
+        return []
+    if isinstance(value, list):
+        steps = []
+        for item in value:
+            if isinstance(item, str):
+                steps.extend(parse_search_sequence(item, default_t0, default_t1))
+            elif isinstance(item, dict):
+                stype = item.get("type")
+                if stype not in {"local", "anneal"}:
+                    raise SystemExit(f"Unknown search step type: {stype}")
+                iters = int(item.get("iters", 0))
+                if iters <= 0:
+                    raise SystemExit(f"Search step {stype} requires positive iters")
+                step = {"type": stype, "iters": iters}
+                if stype == "anneal":
+                    step["t0"] = float(item.get("t0", default_t0))
+                    step["t1"] = float(item.get("t1", default_t1))
+                steps.append(step)
+            else:
+                raise SystemExit("search_sequence entries must be strings or objects")
+        return steps
+    if isinstance(value, str):
+        raw = [v.strip() for v in value.split(",") if v.strip()]
+        steps = []
+        for part in raw:
+            pieces = part.split(":")
+            stype = pieces[0]
+            if stype not in {"local", "anneal"}:
+                raise SystemExit(f"Unknown search step type: {stype}")
+            if len(pieces) < 2:
+                raise SystemExit(f"Search step {stype} requires iters")
+            iters = int(pieces[1])
+            if iters <= 0:
+                raise SystemExit(f"Search step {stype} requires positive iters")
+            step = {"type": stype, "iters": iters}
+            if stype == "anneal":
+                t0 = float(pieces[2]) if len(pieces) > 2 else default_t0
+                t1 = float(pieces[3]) if len(pieces) > 3 else default_t1
+                step["t0"] = t0
+                step["t1"] = t1
+            steps.append(step)
+        return steps
+    raise SystemExit("search_sequence must be list or string")
 def write_coact_csv(coact: List[List[int]], path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         for row in coact:
@@ -226,16 +300,28 @@ def write_coact_csv(coact: List[List[int]], path: str) -> None:
 
 
 def row_partition(replication: Dict[int, int], expert_counts: List[int],
-                  coact: List[List[int]], mesh: Mesh, max_per_device: int) -> Dict[int, List[int]]:
+                  coact: List[List[int]], mesh: Mesh, max_per_device: int, row_capacity: Optional[List[int]] = None, top_n: int = 0) -> Dict[int, List[int]]:
     # Assign base experts to rows using co-activation affinity + load balance
     rows = mesh.rows
     experts = len(expert_counts)
     row_load = [0 for _ in range(rows)]
     row_slots = [0 for _ in range(rows)]
-    row_capacity = max_per_device * mesh.cols
+    if row_capacity is None:
+        row_capacity = [max_per_device * mesh.cols for _ in range(rows)]
     row_experts: List[List[int]] = [[] for _ in range(rows)]
 
-    order = sorted(range(experts), key=lambda e: expert_counts[e], reverse=True)
+    hot = []
+    if top_n and top_n > 0:
+        hot = sorted(range(experts), key=lambda e: expert_counts[e], reverse=True)[:top_n]
+        for e in hot:
+            candidates = [r for r in range(rows) if row_slots[r] < row_capacity[r]]
+            if not candidates:
+                raise SystemExit("All rows saturated during hot-tier placement")
+            r = min(candidates, key=lambda x: (row_load[x], x))
+            row_experts[r].append(e)
+            row_load[r] += expert_counts[e]
+            row_slots[r] += 1
+    order = [e for e in sorted(range(experts), key=lambda e: expert_counts[e], reverse=True) if e not in hot]
     for e in order:
         best_row = 0
         best_score = None
@@ -245,8 +331,8 @@ def row_partition(replication: Dict[int, int], expert_counts: List[int],
             if best_score is None or score > best_score:
                 best_score = score
                 best_row = r
-        if row_slots[best_row] >= row_capacity:
-            candidates = [r for r in range(rows) if row_slots[r] < row_capacity]
+        if row_slots[best_row] >= row_capacity[best_row]:
+            candidates = [r for r in range(rows) if row_slots[r] < row_capacity[r]]
             if not candidates:
                 raise SystemExit("All rows saturated during row_partition")
             best_row = min(candidates, key=lambda r: (row_load[r], r))
@@ -259,7 +345,7 @@ def row_partition(replication: Dict[int, int], expert_counts: List[int],
     for e in range(experts):
         extra = replication[e] - 1
         for _ in range(extra):
-            candidates = [r for r in range(rows) if row_slots[r] < row_capacity]
+            candidates = [r for r in range(rows) if row_slots[r] < row_capacity[r]]
             if not candidates:
                 raise SystemExit("All rows saturated during replica placement")
             candidates.sort(key=lambda r: (e in row_experts[r], row_load[r], r))
@@ -273,7 +359,7 @@ def row_partition(replication: Dict[int, int], expert_counts: List[int],
 
 
 def hot_tier_partition(replication: Dict[int, int], expert_counts: List[int],
-                       coact: List[List[int]], mesh: Mesh, max_per_device: int, top_n: int = 32) -> Dict[int, List[int]]:
+                       coact: List[List[int]], mesh: Mesh, max_per_device: int, top_n: int = 32, row_capacity: Optional[List[int]] = None) -> Dict[int, List[int]]:
     # Spread hot experts across rows, then use row_partition for the rest.
     rows = mesh.rows
     experts = len(expert_counts)
@@ -283,11 +369,12 @@ def hot_tier_partition(replication: Dict[int, int], expert_counts: List[int],
     row_experts: List[List[int]] = [[] for _ in range(rows)]
     row_load = [0 for _ in range(rows)]
     row_slots = [0 for _ in range(rows)]
-    row_capacity = max_per_device * mesh.cols
+    if row_capacity is None:
+        row_capacity = [max_per_device * mesh.cols for _ in range(rows)]
 
     # Place hot experts round-robin by load
     for e in hot:
-        candidates = [r for r in range(rows) if row_slots[r] < row_capacity]
+        candidates = [r for r in range(rows) if row_slots[r] < row_capacity[r]]
         if not candidates:
             raise SystemExit("All rows saturated during hot-tier placement")
         r = min(candidates, key=lambda x: (row_load[x], x))
@@ -306,8 +393,8 @@ def hot_tier_partition(replication: Dict[int, int], expert_counts: List[int],
             if best_score is None or score > best_score:
                 best_score = score
                 best_row = r
-        if row_slots[best_row] >= row_capacity:
-            candidates = [r for r in range(rows) if row_slots[r] < row_capacity]
+        if row_slots[best_row] >= row_capacity[best_row]:
+            candidates = [r for r in range(rows) if row_slots[r] < row_capacity[r]]
             if not candidates:
                 raise SystemExit("All rows saturated during hot-tier placement")
             best_row = min(candidates, key=lambda r: (row_load[r], r))
@@ -320,7 +407,7 @@ def hot_tier_partition(replication: Dict[int, int], expert_counts: List[int],
     for e in range(experts):
         extra = replication[e] - 1
         for _ in range(extra):
-            candidates = [r for r in range(rows) if row_slots[r] < row_capacity]
+            candidates = [r for r in range(rows) if row_slots[r] < row_capacity[r]]
             if not candidates:
                 raise SystemExit("All rows saturated during hot-tier replica placement")
             candidates.sort(key=lambda r: (e in row_experts[r], row_load[r], r))
@@ -334,18 +421,30 @@ def hot_tier_partition(replication: Dict[int, int], expert_counts: List[int],
 
 
 def row_first_balance(replication: Dict[int, int], expert_counts: List[int],
-                      mesh: Mesh, max_per_device: int) -> Dict[int, List[int]]:
+                      mesh: Mesh, max_per_device: int, row_capacity: Optional[List[int]] = None, top_n: int = 0) -> Dict[int, List[int]]:
     # Assign experts to rows to balance row load, ignoring co-activation.
     rows = mesh.rows
     experts = len(expert_counts)
     row_load = [0 for _ in range(rows)]
     row_slots = [0 for _ in range(rows)]
-    row_capacity = max_per_device * mesh.cols
+    if row_capacity is None:
+        row_capacity = [max_per_device * mesh.cols for _ in range(rows)]
     row_experts: List[List[int]] = [[] for _ in range(rows)]
 
-    order = sorted(range(experts), key=lambda e: expert_counts[e], reverse=True)
+    hot = []
+    if top_n and top_n > 0:
+        hot = sorted(range(experts), key=lambda e: expert_counts[e], reverse=True)[:top_n]
+        for e in hot:
+            candidates = [r for r in range(rows) if row_slots[r] < row_capacity[r]]
+            if not candidates:
+                raise SystemExit("All rows saturated during hot-tier placement")
+            r = min(candidates, key=lambda x: (row_load[x], x))
+            row_experts[r].append(e)
+            row_load[r] += expert_counts[e]
+            row_slots[r] += 1
+    order = [e for e in sorted(range(experts), key=lambda e: expert_counts[e], reverse=True) if e not in hot]
     for e in order:
-        candidates = [r for r in range(rows) if row_slots[r] < row_capacity]
+        candidates = [r for r in range(rows) if row_slots[r] < row_capacity[r]]
         if not candidates:
             raise SystemExit("All rows saturated during row-balance placement")
         r = min(candidates, key=lambda x: (row_load[x], x))
@@ -357,7 +456,7 @@ def row_first_balance(replication: Dict[int, int], expert_counts: List[int],
     for e in range(experts):
         extra = replication[e] - 1
         for _ in range(extra):
-            candidates = [r for r in range(rows) if row_slots[r] < row_capacity]
+            candidates = [r for r in range(rows) if row_slots[r] < row_capacity[r]]
             if not candidates:
                 raise SystemExit("All rows saturated during row-balance replica placement")
             r = min(candidates, key=lambda x: (row_load[x], x))
@@ -369,50 +468,154 @@ def row_first_balance(replication: Dict[int, int], expert_counts: List[int],
     return replica_rows
 
 
-def place_within_rows(replica_rows: Dict[int, List[int]], mesh: Mesh, max_per_device: int) -> Placement:
-    # Assign each expert replica to a device within its row (least-loaded)
+def place_within_rows(
+    replica_rows: Dict[int, List[int]],
+    mesh: Mesh,
+    max_per_device: int,
+    expert_counts: List[int],
+    placement: Optional[Placement] = None,
+) -> Placement:
+    # Assign each expert replica to a device within its row (least-loaded by frequency)
     num_devices = mesh.rows * mesh.cols
-    device_load = [0 for _ in range(num_devices)]
+    device_load = [0.0 for _ in range(num_devices)]
+    device_slots = [0 for _ in range(num_devices)]
     expert_replicas: Dict[int, List[int]] = {e: [] for e in replica_rows.keys()}
+    if placement is not None:
+        for e, devs in placement.expert_replicas.items():
+            expert_replicas[e] = list(devs)
+            for did in devs:
+                device_slots[did] += 1
+                if e < len(expert_counts):
+                    device_load[did] += float(expert_counts[e])
     for e, rows in replica_rows.items():
         for r in rows:
             # devices in row r: r*cols .. r*cols+cols-1
             start = r * mesh.cols
             row_devs = list(range(start, start + mesh.cols))
             # pick least-loaded device that is under capacity
-            candidates = [did for did in row_devs if device_load[did] < max_per_device]
+            candidates = [did for did in row_devs if device_slots[did] < max_per_device]
             if not candidates:
-                # fallback: place on any device with capacity
-                candidates = [did for did in range(num_devices) if device_load[did] < max_per_device]
-                if not candidates:
+                # fallback: choose the lowest-load row with capacity, then best device within that row
+                row_candidates = []
+                for rr in range(mesh.rows):
+                    row_devs_rr = [rr * mesh.cols + c for c in range(mesh.cols)]
+                    if any(device_slots[d] < max_per_device for d in row_devs_rr):
+                        row_load = sum(device_load[d] for d in row_devs_rr)
+                        row_candidates.append((row_load, rr))
+                if not row_candidates:
                     raise SystemExit(f"All devices saturated: cannot place more than {max_per_device} replicas per device")
-            best = min(candidates, key=lambda did: (device_load[did], did))
+                _, best_row = min(row_candidates, key=lambda x: (x[0], x[1]))
+                row_devs = [best_row * mesh.cols + c for c in range(mesh.cols)]
+                candidates = [did for did in row_devs if device_slots[did] < max_per_device]
+            best = min(candidates, key=lambda did: (device_load[did], device_slots[did], did))
             expert_replicas[e].append(best)
-            device_load[best] += 1
+            device_slots[best] += 1
+            if e < len(expert_counts):
+                device_load[best] += float(expert_counts[e])
     return Placement(expert_replicas)
 
 
-def shared_expert_row_replication(mesh: Mesh, replicas: int) -> List[int]:
-    # Place shared expert replicas: one per row first, then round-robin across columns.
-    devices = []
+def place_shared_replicas(
+    placement: Placement,
+    mesh: Mesh,
+    max_per_device: int,
+    shared_ids: List[int],
+    replication: Dict[int, int],
+) -> Placement:
+    # Round-robin across rows; within a row, pick least-loaded device (tie: lowest col).
     rows, cols = mesh.rows, mesh.cols
-    for r in range(rows):
-        if len(devices) >= replicas:
-            break
-        devices.append(r * cols)  # first column in each row
-    remaining = replicas - len(devices)
-    if remaining > 0:
-        # fill remaining across rows/cols round-robin, skipping already used
-        for r in range(rows):
-            for c in range(1, cols):
-                if remaining <= 0:
-                    break
+    num_devices = rows * cols
+    device_load = [0 for _ in range(num_devices)]
+    for devs in placement.expert_replicas.values():
+        for did in devs:
+            device_load[did] += 1
+
+    for sid in shared_ids:
+        reps = replication.get(sid, 0)
+        placement.expert_replicas.setdefault(sid, [])
+        for i in range(reps):
+            r = i % rows
+            preferred_col = i % cols
+            chosen = None
+            # Try preferred column first, then round-robin within the same row.
+            for off in range(cols):
+                c = (preferred_col + off) % cols
                 did = r * cols + c
-                devices.append(did)
-                remaining -= 1
-            if remaining <= 0:
-                break
-    return devices
+                if device_load[did] < max_per_device:
+                    chosen = did
+                    break
+            if chosen is None:
+                # Fallback: find any row/col with remaining capacity.
+                for rr in range(rows):
+                    row_devs = [rr * cols + c for c in range(cols)]
+                    candidates = [did for did in row_devs if device_load[did] < max_per_device]
+                    if not candidates:
+                        continue
+                    chosen = min(candidates, key=lambda did: (device_load[did], did % cols))
+                    break
+            if chosen is None:
+                raise SystemExit(f"All devices saturated: cannot place shared replicas (max_per_device={max_per_device})")
+            placement.expert_replicas[sid].append(chosen)
+            device_load[chosen] += 1
+    return placement
+
+
+
+def build_initial_placement(
+    strategy: str,
+    base_replication: Dict[int, int],
+    base_counts: List[int],
+    base_coact: List[List[int]],
+    mesh: Mesh,
+    max_per_device: int,
+    shared_first_placement: Optional[Placement],
+    row_capacity_per_row: List[int],
+    hot_n: int = 32,
+) -> Placement:
+    if strategy == "row-aware":
+        replica_rows = row_partition(
+            base_replication,
+            base_counts,
+            base_coact,
+            mesh,
+            max_per_device,
+            row_capacity=row_capacity_per_row,
+            top_n=hot_n,
+        )
+    elif strategy == "row-balance":
+        replica_rows = row_first_balance(
+            base_replication,
+            base_counts,
+            mesh,
+            max_per_device,
+            row_capacity=row_capacity_per_row,
+            top_n=hot_n,
+        )
+    elif strategy == "hot-tier":
+        replica_rows = hot_tier_partition(
+            base_replication,
+            base_counts,
+            base_coact,
+            mesh,
+            max_per_device,
+            top_n=hot_n,
+            row_capacity=row_capacity_per_row,
+        )
+    else:
+        raise SystemExit(f"Unknown placement strategy: {strategy}")
+
+    return place_within_rows(
+        replica_rows,
+        mesh,
+        max_per_device,
+        base_counts,
+        placement=shared_first_placement,
+    )
+def _strip_shared_replica_rows(replica_rows: Dict[int, List[int]], shared_ids: List[int]) -> Dict[int, List[int]]:
+    for sid in shared_ids:
+        if sid in replica_rows:
+            replica_rows.pop(sid)
+    return replica_rows
 
 def placement_to_device_map(placement: Placement) -> Dict[int, List[int]]:
     # device_id -> list of experts (one entry per replica)
@@ -756,8 +959,10 @@ def main() -> None:
     ap.add_argument("--experts", type=int, default=256)
     ap.add_argument("--slots", type=int, default=384)
     ap.add_argument("--iters", type=int, default=50)
-    ap.add_argument("--search", choices=["random", "row-aware", "anneal", "row-balance", "hot-tier", "hybrid"], default="row-balance")
+    ap.add_argument("--placement-strategy", choices=["row-balance", "row-aware", "hot-tier"], default="row-balance")
+    ap.add_argument("--search", choices=["random", "none", "local", "anneal", "hybrid"], default="none")
     ap.add_argument("--search-config", default="", help="JSON file with search-specific parameters")
+    ap.add_argument("--search-sequence", default="", help="Comma-separated search steps, e.g. local:200,anneal:500:1.0:0.01,local:10")
     ap.add_argument("--system-config", default="", help="JSON file with system/dataset parameters")
     ap.add_argument("--initial-placement-config", default="", help="JSON file with initial placement parameters")
     ap.add_argument("--local-search-iters", type=int, default=200)
@@ -774,8 +979,11 @@ def main() -> None:
     ap.add_argument("--routing-strategy", choices=["least-loaded", "balanced-replicas"], default="least-loaded")
     ap.add_argument("--capacity-factor", type=float, default=2.0)
     ap.add_argument("--num-shared-experts", type=int, default=1, help="Number of shared experts to append")
-    ap.add_argument("--no-shared-expert-row-replication", action="store_true",
-                    help="Disable shared expert row-first replication placement")
+    ap.add_argument(
+        "--shared-expert-round-robin-in-rows",
+        action="store_true",
+        help="Place shared expert replicas round-robin across rows (initial placement)",
+    )
     ap.add_argument("--objective", choices=["mean", "p95", "p99"], default="mean")
     ap.add_argument("--origin-mode", choices=["average-rows", "round-robin", "random"], default="average-rows")
     ap.add_argument("--save-placement", default="", help="Folder to store placement artifacts")
@@ -810,7 +1018,7 @@ def main() -> None:
     init_cfg = {}
     if args.initial_placement_config:
         init_cfg = _load_jsonc(args.initial_placement_config)
-        allowed = {"no_shared_expert_row_replication"}
+        allowed = {"shared_expert_round_robin_in_rows", "placement_strategy"}
         unknown = [k for k in init_cfg.keys() if k not in allowed]
         if unknown:
             raise SystemExit(f"--initial-placement-config has unknown keys: {', '.join(unknown)}")
@@ -821,17 +1029,18 @@ def main() -> None:
     search_config = {}
     required_by_search = {
         "random": {"search", "iters", "restarts"},
-        "row-aware": {"search", "local_search_iters", "restarts"},
-        "row-balance": {"search", "restarts"},
-        "hot-tier": {"search", "restarts"},
+        "none": {"search", "restarts"},
+        "local": {"search", "local_search_iters", "restarts"},
         "anneal": {"search", "anneal_iters", "anneal_t0", "anneal_t1", "restarts"},
-        "hybrid": {"search", "local_search_iters", "local_search_final_iters", "anneal_iters", "anneal_t0", "anneal_t1", "restarts"},
+        "sequence": {"search", "search_sequence", "restarts"},
     }
     if args.search_config:
         search_config = _load_jsonc(args.search_config)
         if "search" not in search_config:
             raise SystemExit("--search-config must include a 'search' field")
         search_name = search_config["search"]
+        if "search_sequence" in search_config and search_name != "sequence":
+            raise SystemExit("--search-config with search_sequence must set search=sequence")
         if search_name not in required_by_search:
             raise SystemExit(f"--search-config has unknown search type: {search_name}")
         required = required_by_search[search_name]
@@ -845,6 +1054,20 @@ def main() -> None:
     if args.search == "random" and args.seed == 0:
         args.seed = random.SystemRandom().randint(1, 2**31 - 1)
     random.seed(args.seed)
+
+
+    if args.search_sequence:
+        args.search = "sequence"
+
+    search_sequence_steps = parse_search_sequence(args.search_sequence) if args.search_sequence else []
+    if args.search == "sequence":
+        if not search_sequence_steps:
+            # maybe provided in config as list
+            if isinstance(getattr(args, "search_sequence", None), list):
+                search_sequence_steps = parse_search_sequence(args.search_sequence)
+        if not search_sequence_steps:
+            raise SystemExit("search=sequence requires search_sequence")
+
     # Print grouped configuration (including defaults)
     print("search config:", file=sys.stderr)
     sys_keys = [
@@ -852,9 +1075,9 @@ def main() -> None:
         "routing_strategy", "capacity_factor", "objective", "origin_mode",
         "max_records", "fast_test_pct", "max_seq_len",
     ]
-    init_keys = ["no_shared_expert_row_replication"]
+    init_keys = ["shared_expert_round_robin_in_rows", "placement_strategy"]
     search_keys = [
-        "search", "iters", "local_search_iters", "local_search_final_iters",
+        "search", "search_sequence", "iters", "local_search_iters", "local_search_final_iters",
         "anneal_iters", "anneal_t0", "anneal_t1", "restarts",
     ]
     misc_keys = [
@@ -897,14 +1120,23 @@ def main() -> None:
             "experts": args.experts,
             "slots": args.slots,
             "search": args.search,
+            "placement_strategy": args.placement_strategy,
+            "search_sequence": args.search_sequence,
             "routing_strategy": args.routing_strategy,
             "capacity_factor": args.capacity_factor,
             "objective": args.objective,
             "origin_mode": args.origin_mode,
             "num_shared_experts": args.num_shared_experts,
-            "shared_row_replication": not args.no_shared_expert_row_replication,
+            "shared_expert_round_robin_in_rows": args.shared_expert_round_robin_in_rows,
         }
         for k, v in expected.items():
+            if k == "shared_expert_round_robin_in_rows" and k not in run_cfg and "shared_row_replication" in run_cfg:
+                legacy = not bool(run_cfg.get("shared_row_replication"))
+                if str(legacy) != str(v):
+                    raise SystemExit(
+                        f"run_config mismatch for {k}: expected {v}, found legacy shared_row_replication={run_cfg.get('shared_row_replication')}"
+                    )
+                continue
             if str(run_cfg.get(k)) != str(v):
                 raise SystemExit(f"run_config mismatch for {k}: expected {v}, found {run_cfg.get(k)}")
 
@@ -983,18 +1215,28 @@ def main() -> None:
 
     coact = build_coact_matrix(trace, total_experts, include_shared=include_shared, shared_ids=shared_ids)
 
-    shared_devices = None
-    if include_shared and not args.no_shared_expert_row_replication:
-        shared_row_list = []
-        for sid in shared_ids:
-            shared_reps = replication.get(sid, 0)
-            shared_devices = shared_expert_row_replication(mesh, shared_reps)
-            if shared_devices:
-                shared_row_list.extend([mesh.devices()[did].row for did in shared_devices])
-    else:
-        shared_row_list = []
+    shared_row_replication_enabled = include_shared and args.shared_expert_round_robin_in_rows
+    base_counts = counts
+    base_coact = coact
+    base_replication = replication
+    if shared_row_replication_enabled and shared_ids:
+        base_counts = counts[:args.experts]
+        base_coact = [row[:args.experts] for row in coact[:args.experts]]
+        base_replication = {k: v for k, v in replication.items() if k < args.experts}
 
     max_per_device = int(math.ceil(args.slots / (args.rows * args.cols)))
+
+    shared_first_placement: Optional[Placement] = None
+    if shared_row_replication_enabled and shared_ids:
+        shared_first_placement = Placement(expert_replicas={})
+        shared_first_placement = place_shared_replicas(
+            shared_first_placement,
+            mesh,
+            max_per_device,
+            shared_ids,
+            replication,
+        )
+    row_capacity_per_row = row_capacity_from_shared(mesh, max_per_device, shared_first_placement)
 
     def _evaluate_and_print(label: str, placement: Placement, seed: int) -> Tuple[Dict[str, float], Placement]:
         score = evaluate(
@@ -1026,12 +1268,22 @@ def main() -> None:
             print(f"restart {r_idx + 1}/{args.restarts}")
         random.seed(args.seed + r_idx)
 
-        if args.search == "row-aware":
-            replica_rows = row_partition(replication, counts, coact, mesh, max_per_device)
-            if shared_row_list:
-                for sid in shared_ids:
-                    replica_rows[sid] = shared_row_list
-            placement = place_within_rows(replica_rows, mesh, max_per_device)
+        if args.search != "random":
+            placement = build_initial_placement(
+                args.placement_strategy,
+                base_replication,
+                base_counts,
+                base_coact,
+                mesh,
+                max_per_device,
+                shared_first_placement,
+                row_capacity_per_row,
+                hot_n=32,
+            )
+
+        if args.search == "none":
+            score, placement = _evaluate_and_print("placement-only", placement, args.seed + r_idx)
+        elif args.search == "local":
             placement = local_search(
                 trace, placement, mesh, params,
                 routing_strategy=args.routing_strategy,
@@ -1044,13 +1296,8 @@ def main() -> None:
                 profile_eval=args.profile_eval,
                 shared_ids=shared_ids,
             )
-            score, placement = _evaluate_and_print("row-aware", placement, args.seed + r_idx)
+            score, placement = _evaluate_and_print("local", placement, args.seed + r_idx)
         elif args.search == "anneal":
-            replica_rows = row_partition(replication, counts, coact, mesh, max_per_device)
-            if shared_row_list:
-                for sid in shared_ids:
-                    replica_rows[sid] = shared_row_list
-            placement = place_within_rows(replica_rows, mesh, max_per_device)
             placement = simulated_annealing(
                 trace, placement, mesh, params,
                 routing_strategy=args.routing_strategy,
@@ -1064,69 +1311,47 @@ def main() -> None:
                 shared_ids=shared_ids,
             )
             score, placement = _evaluate_and_print("anneal", placement, args.seed + r_idx)
-        elif args.search == "row-balance":
-            replica_rows = row_first_balance(replication, counts, mesh, max_per_device)
-            if shared_row_list:
-                for sid in shared_ids:
-                    replica_rows[sid] = shared_row_list
-            placement = place_within_rows(replica_rows, mesh, max_per_device)
-            score, placement = _evaluate_and_print("row-balance", placement, args.seed + r_idx)
-        elif args.search == "hot-tier":
-            replica_rows = hot_tier_partition(replication, counts, coact, mesh, max_per_device, top_n=32)
-            if shared_row_list:
-                for sid in shared_ids:
-                    replica_rows[sid] = shared_row_list
-            placement = place_within_rows(replica_rows, mesh, max_per_device)
-            score, placement = _evaluate_and_print("hot-tier", placement, args.seed + r_idx)
-        elif args.search == "hybrid":
-            replica_rows = row_first_balance(replication, counts, mesh, max_per_device)
-            if shared_row_list:
-                for sid in shared_ids:
-                    replica_rows[sid] = shared_row_list
-            placement = place_within_rows(replica_rows, mesh, max_per_device)
-            placement = local_search(
-                trace, placement, mesh, params,
-                routing_strategy=args.routing_strategy,
-                capacity_factor=args.capacity_factor,
-                include_shared=include_shared,
-                objective=args.objective,
-                iters=args.local_search_iters,
-                show_progress=True,
-                label="local_search",
-                profile_eval=args.profile_eval,
-                shared_ids=shared_ids,
-            )
-            placement = simulated_annealing(
-                trace, placement, mesh, params,
-                routing_strategy=args.routing_strategy,
-                capacity_factor=args.capacity_factor,
-                include_shared=include_shared,
-                objective=args.objective,
-                iters=args.anneal_iters, t0=args.anneal_t0, t1=args.anneal_t1,
-                show_progress=True,
-                label="anneal",
-                profile_eval=args.profile_eval,
-                shared_ids=shared_ids,
-            )
-            placement = local_search(
-                trace, placement, mesh, params,
-                routing_strategy=args.routing_strategy,
-                capacity_factor=args.capacity_factor,
-                include_shared=include_shared,
-                objective=args.objective,
-                iters=args.local_search_final_iters,
-                show_progress=True,
-                label="local_search2",
-                profile_eval=args.profile_eval,
-                shared_ids=shared_ids,
-            )
-            score, placement = _evaluate_and_print("hybrid", placement, args.seed + r_idx)
+        # hybrid removed; use search=sequence
+        
+        elif args.search == "sequence":
+            for step in search_sequence_steps:
+                if step["type"] == "local":
+                    placement = local_search(
+                        trace, placement, mesh, params,
+                        routing_strategy=args.routing_strategy,
+                        capacity_factor=args.capacity_factor,
+                        include_shared=include_shared,
+                        objective=args.objective,
+                        iters=step["iters"],
+                        show_progress=True,
+                        label="local_search",
+                        profile_eval=args.profile_eval,
+                        shared_ids=shared_ids,
+                    )
+                elif step["type"] == "anneal":
+                    placement = simulated_annealing(
+                        trace, placement, mesh, params,
+                        routing_strategy=args.routing_strategy,
+                        capacity_factor=args.capacity_factor,
+                        include_shared=include_shared,
+                        objective=args.objective,
+                        iters=step["iters"], t0=step["t0"], t1=step["t1"],
+                        show_progress=True,
+                        label="anneal",
+                        profile_eval=args.profile_eval,
+                        shared_ids=shared_ids,
+                    )
+            score, placement = _evaluate_and_print("sequence", placement, args.seed + r_idx)
         else:
             score = None
             placement = None
             start_time = time.time()
             for i in range(args.iters):
-                cand = random_placement(replication, mesh, max_per_device)
+                if shared_row_replication_enabled:
+                    base_rep = base_replication
+                    cand = random_placement(base_rep, mesh, max_per_device, placement=shared_first_placement)
+                else:
+                    cand = random_placement(replication, mesh, max_per_device)
                 cand_score = evaluate(
                     trace,
                     cand,
@@ -1229,12 +1454,14 @@ def main() -> None:
             "experts": args.experts,
             "slots": args.slots,
             "search": args.search,
+            "placement_strategy": args.placement_strategy,
+            "search_sequence": args.search_sequence,
             "routing_strategy": args.routing_strategy,
             "capacity_factor": args.capacity_factor,
             "objective": args.objective,
             "origin_mode": args.origin_mode,
             "num_shared_experts": args.num_shared_experts,
-            "shared_row_replication": not args.no_shared_expert_row_replication,
+            "shared_expert_round_robin_in_rows": args.shared_expert_round_robin_in_rows,
             "search_config": args.search_config,
             "search_config_content": search_config,
             "system_config": args.system_config,

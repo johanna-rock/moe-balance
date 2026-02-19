@@ -154,7 +154,7 @@ def main() -> None:
         plt.close(fig)
         sys_cfg = sys_cfgs.get(sig, {}).copy()
         for k in ["command", "search", "search_config", "search_config_content", "objective",
-                  "origin_mode", "shared_row_replication"]:
+                  "origin_mode", "shared_expert_round_robin_in_rows"]:
             if k in sys_cfg:
                 sys_cfg.pop(k)
         meta = {

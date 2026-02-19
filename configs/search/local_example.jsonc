@@ -1,0 +1,6 @@
+// Search config (local search only)
+{
+  "search": "local",
+  "local_search_iters": 200,
+  "restarts": 1
+}

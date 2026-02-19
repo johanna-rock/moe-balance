@@ -1,11 +1,6 @@
+// Search config (random placements)
 {
-  // Search type
-  // Evaluates random placements and keeps the best.
-  "search": "random", // random placements, keep best
-
-  // Random search iterations
-  "iters": 200, // number of random placements to evaluate
-
-  // Number of randomized restarts
-  "restarts": 2 // repeat search with different seeds
+  "search": "random",
+  "iters": 10,
+  "restarts": 1
 }

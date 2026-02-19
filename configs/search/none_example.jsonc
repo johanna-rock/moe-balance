@@ -1,0 +1,5 @@
+// Search config (no search, placement only)
+{
+  "search": "none",
+  "restarts": 1
+}

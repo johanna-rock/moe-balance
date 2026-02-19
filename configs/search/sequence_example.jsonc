@@ -1,0 +1,10 @@
+// Search config (custom sequence)
+{
+  "search": "sequence",
+  "search_sequence": [
+    {"type": "local", "iters": 50},
+    {"type": "anneal", "iters": 200, "t0": 1.0, "t1": 0.01},
+    {"type": "local", "iters": 25}
+  ],
+  "restarts": 1
+}

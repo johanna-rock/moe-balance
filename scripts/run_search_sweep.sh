@@ -54,11 +54,11 @@ run_search () {
 
 # # Multiple hybrid runs
 # for i in $(seq 1 "${RUNS_HYBRID}"); do
-#   run_search "configs/search/hybrid_example.jsonc" "${SYSTEM_CONFIG_SMALL}"
-# done
+#   # done
 
 # Single runs for other search types
-# run_search "configs/search/row_balance_example.jsonc" "${SYSTEM_CONFIG}"
-# run_search "configs/search/row_aware_example.jsonc" "${SYSTEM_CONFIG}"
-run_search "configs/search/hot_tier_example.jsonc" "${SYSTEM_CONFIG}"
+# run_search "configs/search/local_example.jsonc" "${SYSTEM_CONFIG}"
+run_search "configs/search/none_example.jsonc" "${SYSTEM_CONFIG}"
+run_search "configs/search/local_example.jsonc" "${SYSTEM_CONFIG}"
 run_search "configs/search/anneal_example.jsonc" "${SYSTEM_CONFIG}"
+run_search "configs/search/sequence_example.jsonc" "${SYSTEM_CONFIG}"

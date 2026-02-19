@@ -1,8 +1,0 @@
-{
-  // Search type
-  // Greedy row-first placement that balances replicas across rows/cols.
-  "search": "row-balance", // row-first + column-balance placement
-
-  // Number of randomized restarts
-  "restarts": 2 // repeat search with different seeds
-}
