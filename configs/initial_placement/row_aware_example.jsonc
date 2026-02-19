@@ -1,5 +1,6 @@
 // Initial placement config
 {
-  "placement_strategy": "row-aware", // Options: row-balance, row-aware, hot-tier
+  "placement_strategy": "aware", // Options: balance, aware, hot-tier
+  "placement_axis": "row", // balance experts across row or col
   "shared_expert_round_robin_in_rows": true // place shared replicas round-robin across rows+cols
 }
