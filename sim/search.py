@@ -438,6 +438,7 @@ def local_search(trace: List[Dict], placement: Placement, mesh: Mesh,
                  profile_eval: bool = False,
                  shared_ids: Optional[List[int]] = None) -> Placement:
     best = placement
+    eval_show = profile_eval
     best_score = evaluate(
         trace,
         best,
@@ -446,7 +447,8 @@ def local_search(trace: List[Dict], placement: Placement, mesh: Mesh,
         routing_strategy,
         capacity_factor,
         include_shared,
-        profile_eval=profile_eval and not show_progress,
+        show_progress=eval_show,
+        profile_eval=profile_eval,
         shared_ids=shared_ids,
     )[objective]
     device_map = placement_to_device_map(best)
@@ -478,7 +480,8 @@ def local_search(trace: List[Dict], placement: Placement, mesh: Mesh,
             routing_strategy,
             capacity_factor,
             include_shared,
-            profile_eval=profile_eval and not show_progress,
+            show_progress=eval_show,
+            profile_eval=profile_eval,
             shared_ids=shared_ids,
         )[objective]
         if score < best_score:
@@ -504,6 +507,7 @@ def simulated_annealing(trace: List[Dict], placement: Placement, mesh: Mesh,
                         profile_eval: bool = False,
                         shared_ids: Optional[List[int]] = None) -> Placement:
     current = placement
+    eval_show = profile_eval
     current_score = evaluate(
         trace,
         current,
@@ -512,7 +516,8 @@ def simulated_annealing(trace: List[Dict], placement: Placement, mesh: Mesh,
         routing_strategy,
         capacity_factor,
         include_shared,
-        profile_eval=profile_eval and not show_progress,
+        show_progress=eval_show,
+        profile_eval=profile_eval,
         shared_ids=shared_ids,
     )[objective]
     best = current
@@ -549,7 +554,8 @@ def simulated_annealing(trace: List[Dict], placement: Placement, mesh: Mesh,
             routing_strategy,
             capacity_factor,
             include_shared,
-            profile_eval=profile_eval and not show_progress,
+            show_progress=eval_show,
+            profile_eval=profile_eval,
             shared_ids=shared_ids,
         )[objective]
         delta = score - current_score
@@ -670,9 +676,7 @@ def evaluate(trace: List[Dict], placement: Placement, mesh: Mesh, params: CostPa
     rng = random.Random(seed)
     start_time = time.perf_counter()
     for idx, rec in enumerate(trace):
-        topk = rec["topk_experts"]
-        if include_shared and shared_ids:
-            topk = _add_shared_experts(topk, shared_ids)
+        topk = rec.get("topk_with_shared") if include_shared and shared_ids and "topk_with_shared" in rec else rec["topk_experts"]
         origin_rows = rec.get("origin_rows", [])
         num_tokens = len(topk)
         if not origin_rows:
@@ -715,7 +719,7 @@ def evaluate(trace: List[Dict], placement: Placement, mesh: Mesh, params: CostPa
             else:
                 r = simulate_batch(origin_rows, topk, placement, mesh, params)
         results.append(r)
-        if show_progress and total > 0 and (idx % 10 == 0 or idx == total - 1):
+        if show_progress and total > 0 and (profile_eval or idx % 10 == 0 or idx == total - 1):
             pct = int((idx + 1) / total * 100)
             elapsed = time.perf_counter() - start_time
             frac = (idx + 1) / total
@@ -864,7 +868,11 @@ def main() -> None:
                 print(f"  {k}: {getattr(args, k)}", file=sys.stderr)
     _print_group("system", sys_keys)
     _print_group("initial_placement", init_keys)
-    _print_group("search", search_keys)
+    # Only show search parameters relevant to the selected search type.
+    active_search_keys = list(required_by_search.get(args.search, {"search"}))
+    # Keep a stable, readable order.
+    ordered = [k for k in search_keys if k in active_search_keys]
+    _print_group("search", ordered)
     _print_group("misc", misc_keys)
 
     # Plot-only mode: validate config and render plots without running search.
@@ -950,11 +958,12 @@ def main() -> None:
     include_shared = args.num_shared_experts > 0
     total_experts = args.experts + max(0, args.num_shared_experts)
     shared_ids = list(range(args.experts, args.experts + max(0, args.num_shared_experts)))
+    if include_shared and shared_ids:
+        for rec in trace:
+            rec["topk_with_shared"] = _add_shared_experts(rec["topk_experts"], shared_ids)
     counts = [0 for _ in range(total_experts)]
     for rec in trace:
-        topk = rec["topk_experts"]
-        if include_shared and shared_ids:
-            topk = _add_shared_experts(topk, shared_ids)
+        topk = rec.get("topk_with_shared") if include_shared and shared_ids and "topk_with_shared" in rec else rec["topk_experts"]
         for experts in topk:
             for e in experts:
                 counts[e] += 1
@@ -1000,7 +1009,7 @@ def main() -> None:
             label="eval",
             origin_mode=args.origin_mode,
             seed=seed,
-            profile_eval=False,
+            profile_eval=args.profile_eval,
             shared_ids=shared_ids,
         )
         print(

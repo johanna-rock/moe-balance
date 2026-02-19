@@ -4,9 +4,9 @@
   "search": "hybrid", // row-balance -> local_search -> anneal -> local_search
 
   // Hybrid parameters
-  "local_search_iters": 300, // swap iterations in first local search
-  "local_search_final_iters": 200, // swap iterations in final local search
-  "anneal_iters": 1000, // annealing iterations
+  "local_search_iters": 50, // swap iterations in first local search
+  "local_search_final_iters": 50, // swap iterations in final local search
+  "anneal_iters": 300, // annealing iterations
   "anneal_t0": 1.0, // initial temperature
   "anneal_t1": 0.01, // final temperature
 

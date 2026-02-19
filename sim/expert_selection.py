@@ -95,6 +95,23 @@ def balanced_expert_selection_replicas(
     if capacity < 1:
         capacity = 1
 
+    # Fast path: if per-instance capacity can hold the entire batch, routing always
+    # chooses the first replica (capacity never fills).
+    if capacity >= batch:
+        active_experts = [[-1 for _ in range(k)] for _ in range(batch)]
+        active_weights = [[0.0 for _ in range(k)] for _ in range(batch)]
+        for token_id in range(batch):
+            for token_rank in range(k):
+                expert_id = topk_experts[token_id][token_rank]
+                if expert_id < 0 or expert_id >= len(expert_id_mapping):
+                    raise AssertionError(f"expert_id out of range: {expert_id} (mapping size {len(expert_id_mapping)})")
+                replicas = expert_id_mapping[expert_id]
+                chosen = replicas[0] if replicas else -1
+                if chosen >= 0:
+                    active_experts[token_id][token_rank] = chosen
+                    active_weights[token_id][token_rank] = 1.0
+        return active_experts, active_weights
+
     token_count_per_instance = [0 for _ in range(num_expert_instances)]
     rr_index = [0 for _ in range(len(expert_id_mapping))]
     active_experts = [[-1 for _ in range(k)] for _ in range(batch)]

@@ -4,7 +4,7 @@
   "search": "row-aware", // row partitioning using co-activation
 
   // Local search iterations
-  "local_search_iters": 500, // swap iterations
+  "local_search_iters": 100, // swap iterations
 
   // Number of randomized restarts
   "restarts": 2 // repeat search with different seeds
