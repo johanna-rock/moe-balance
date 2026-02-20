@@ -9,8 +9,14 @@ from typing import Dict, List, Tuple
 def load_placement(path: str) -> Dict[int, List[int]]:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    # keys may be strings
-    return {int(k): v for k, v in data.items()}
+    expert_replicas: Dict[int, List[int]] = {}
+    for k, v in data.items():
+        eid = int(k)
+        if isinstance(v, list) and v and isinstance(v[0], dict):
+            expert_replicas[eid] = [int(item["device"]) for item in v]
+        else:
+            expert_replicas[eid] = [int(d) for d in v]
+    return expert_replicas
 
 
 def compute_freqs(trace_path: str, experts: int, include_shared: bool, shared_id: int = 256) -> List[float]:
@@ -47,6 +53,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Plot placement grid with expert bars")
     ap.add_argument("--placement", required=True, help="placement.json from search run")
     ap.add_argument("--trace", required=True, help="trace JSONL")
+    ap.add_argument("--dataset", required=True, help="Dataset name (for logging/consistency)")
     ap.add_argument("--out", required=True, help="Output PNG")
     ap.add_argument("--rows", type=int, default=16)
     ap.add_argument("--cols", type=int, default=8)
@@ -56,27 +63,25 @@ def main() -> None:
     ap.add_argument("--only-original", action="store_true", help="Plot only one bar per original expert")
     ap.add_argument("--baseline-original", action="store_true", help="Ignore placement; use row-wise expert ids + shared per device")
     ap.add_argument("--text", action="store_true", help="Render text values instead of bar heights")
-    ap.add_argument("--freq-folder", default="", help="Folder containing expert_frequency.csv")
-    ap.add_argument("--layer", type=int, default=0, help="Layer id to select from expert_frequency.csv")
+    ap.add_argument("--freq-folder", required=True, help="Folder containing expert_frequency.csv")
+    ap.add_argument("--layer", type=int, required=True, help="Layer id to select from expert_frequency.csv")
     args = ap.parse_args()
 
-    if args.freq_folder:
-        freq_csv = os.path.join(args.freq_folder, "expert_frequency.csv")
-        try:
-            with open(freq_csv, "r", encoding="utf-8") as f:
-                rows = f.readlines()
-            freqs = None
-            for line in rows[1:]:
-                if line.startswith(f"Layer {args.layer},"):
-                    parts = line.strip().split(",")[1:]
-                    freqs = [float(x) for x in parts]
-                    break
-            if freqs is None:
-                freqs = compute_freqs(args.trace, args.experts + (1 if args.include_shared else 0), args.include_shared, args.shared_id)
-        except Exception:
-            freqs = compute_freqs(args.trace, args.experts + (1 if args.include_shared else 0), args.include_shared, args.shared_id)
-    else:
-        freqs = compute_freqs(args.trace, args.experts + (1 if args.include_shared else 0), args.include_shared, args.shared_id)
+    if not args.freq_folder:
+        raise SystemExit("--freq-folder is required and must contain expert_frequency.csv")
+    freq_csv = os.path.join(args.freq_folder, "expert_frequency.csv")
+    if not os.path.exists(freq_csv):
+        raise SystemExit(f"expert_frequency.csv not found at {freq_csv}")
+    with open(freq_csv, "r", encoding="utf-8") as f:
+        rows = f.readlines()
+    freqs = None
+    for line in rows[1:]:
+        if line.startswith(f"Layer {args.layer},"):
+            parts = line.strip().split(",")[1:]
+            freqs = [float(x) for x in parts]
+            break
+    if freqs is None:
+        raise SystemExit(f"Layer {args.layer} not found in {freq_csv}")
     if args.baseline_original:
         # Baseline: gated experts placed in row-wise order, one shared expert per device.
         instance_to_device = []

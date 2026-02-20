@@ -16,6 +16,16 @@ def load_trace_record(trace_path: str, layer: int) -> Dict:
     raise SystemExit(f"No record found for layer {layer}")
 
 
+def _parse_placement_json(raw: dict) -> Placement:
+    expert_replicas = {}
+    for k, v in raw.items():
+        eid = int(k)
+        if isinstance(v, list) and v and isinstance(v[0], dict):
+            expert_replicas[eid] = [int(item["device"]) for item in v]
+        else:
+            expert_replicas[eid] = [int(d) for d in v]
+    return Placement(expert_replicas=expert_replicas)
+
 def build_instance_mapping(placement: Placement) -> Tuple[List[List[int]], List[int], List[int]]:
     max_expert_id = max(placement.expert_replicas.keys()) if placement.expert_replicas else -1
     expert_id_mapping: List[List[int]] = [[] for _ in range(max_expert_id + 1)]
@@ -52,7 +62,7 @@ def main() -> None:
 
     with open(args.placement, "r", encoding="utf-8") as f:
         raw = json.load(f)
-    placement = Placement(expert_replicas={int(k): v for k, v in raw.items()})
+    placement = _parse_placement_json(raw)
 
     rec = load_trace_record(args.trace, args.layer)
     topk = rec.get("topk_experts", [])

@@ -2,5 +2,5 @@
 {
   "placement_strategy": "balance",
   "placement_axis": "col", // balance experts across row or col
-  "shared_expert_round_robin_in_rows": true
+  "replica_spread_by_distance": true
 }

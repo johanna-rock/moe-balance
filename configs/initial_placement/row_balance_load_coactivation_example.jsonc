@@ -1,6 +1,6 @@
 // Initial placement config
 {
-  "placement_strategy": "balance", // Options: balance, balance_load_coactivation, hot-tier
+  "placement_strategy": "balance_load_coactivation", // Options: balance, balance_load_coactivation, hot-tier
   "placement_axis": "row", // balance experts across row or col
   "replica_spread_by_distance": true // place shared replicas round-robin across rows+cols
 }

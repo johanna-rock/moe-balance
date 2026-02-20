@@ -1,6 +1,6 @@
 // Initial placement config
 {
-  "placement_strategy": "aware",
+  "placement_strategy": "balance_load_coactivation",
   "placement_axis": "col", // balance experts across row or col
-  "shared_expert_round_robin_in_rows": true
+  "replica_spread_by_distance": true
 }

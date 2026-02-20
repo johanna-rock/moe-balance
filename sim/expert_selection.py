@@ -10,7 +10,7 @@ def balanced_expert_selection_with_rerouting(
     num_expert_instances: int,
 ) -> Tuple[List[List[int]], List[List[float]]]:
     """
-    Balanced expert selection with capacity and replica-aware rerouting.
+    Balanced expert selection with capacity and replica-balance_load_coactivation rerouting.
 
     scores_with_bias: [BATCH][NUM_GATED_EXPERTS]
     expert_id_mapping: [NUM_ORIGINAL_EXPERTS][MAX_NUM_REPLICAS] -> expert instance ids
@@ -75,7 +75,7 @@ def balanced_expert_selection_replicas(
     num_expert_instances: int,
 ) -> Tuple[List[List[int]], List[List[float]]]:
     """
-    Balanced expert selection with capacity and replica-aware routing.
+    Balanced expert selection with capacity and replica-balance_load_coactivation routing.
     Uses top-k experts (no rerouting across original experts). If all replicas
     of an expert are full, it round-robins across replicas (no dropping).
 

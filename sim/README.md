@@ -9,17 +9,26 @@ python3 sim/generate_trace.py --out /tmp/trace.jsonl --layers 1 --batches 50 --t
 
 2) Run a simple random search:
 ```bash
-python3 sim/search.py --trace /tmp/trace.jsonl --layer 0 --rows 16 --cols 8 --experts 256 --slots 384 --iters 20
+python3 sim/search.py \
+  --system-config configs/system/system_example.jsonc \
+  --search-config configs/search/random_example.jsonc \
+  --initial-placement-config configs/initial_placement/row_balance_example.jsonc
 ```
 
-3) Run row-aware placement + local search:
+3) Run balance_load_coactivation placement + local search:
 ```bash
-python3 sim/search.py --trace /tmp/trace.jsonl --layer 0 --rows 16 --cols 8 --experts 256 --slots 384 --search row-aware --local-search-iters 200
+python3 sim/search.py \
+  --system-config configs/system/system_example.jsonc \
+  --search-config configs/search/local_example.jsonc \
+  --initial-placement-config configs/initial_placement/row_balance_load_coactivation_example.jsonc
 ```
 
-4) Run row-aware placement + simulated annealing:
+4) Run balance_load_coactivation placement + simulated annealing:
 ```bash
-python3 sim/search.py --trace /tmp/trace.jsonl --layer 0 --rows 16 --cols 8 --experts 256 --slots 384 --search anneal --anneal-iters 500 --anneal-t0 1.0 --anneal-t1 0.01
+python3 sim/search.py \
+  --system-config configs/system/system_example.jsonc \
+  --search-config configs/search/anneal_example.jsonc \
+  --initial-placement-config configs/initial_placement/row_balance_load_coactivation_example.jsonc
 ```
 
 5) Write a co-activation CSV (experts x experts):
